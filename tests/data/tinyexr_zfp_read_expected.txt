@@ -1,0 +1,2 @@
+tinyexr_zfp_read 100 62b3f6bad997526a
+tinyexr_zfp_read bytes of files: 368568; headers read: 63, images read: 48, refused: 15, left: 0, where tinyexr stops: 0; as red, green, blue and alpha: 39

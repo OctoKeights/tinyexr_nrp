@@ -1,0 +1,2 @@
+tinyexr_deep 80 8e58fb32797af06d
+tinyexr_deep bytes of files: 225734; read where it depends on what is outside the file: 0, where tinyexr stops: 2, left: 0

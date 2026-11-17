@@ -1,0 +1,2 @@
+tinyexr_parts 60 517d4190fd028f77
+tinyexr_parts bytes of files: 221521; saved: 47, not saved: 13; read where it depends on what is past the end: 1, where tinyexr stops: 0

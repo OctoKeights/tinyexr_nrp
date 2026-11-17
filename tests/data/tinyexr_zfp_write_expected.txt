@@ -1,0 +1,3 @@
+tinyexr_zfp_write 200 6aeee7680ab193b0
+tinyexr_zfp_write 300 f482813b93589555
+tinyexr_zfp_write bytes of files: 1077674; saved: 206, not saved: 94, saved the short way: 63

@@ -1,0 +1,2 @@
+tinyexr_read_small 100 10e872b90ebb47bb
+tinyexr_read_small bytes of files: 149302; headers read: 74, images read: 60, refused: 14, left: 0, where tinyexr stops: 0; as red, green, blue and alpha: 51
