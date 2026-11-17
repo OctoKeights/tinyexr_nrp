@@ -510,9 +510,9 @@ fn encode_chunk(
                 return ret;
             }
 
-            for j in 0..num_y_tiles as usize {
-                for i in 0..num_x_tiles as usize {
-                    offset_data.offsets[level as usize][j][i] = offset;
+            for row in &mut offset_data.offsets[level as usize][..num_y_tiles as usize] {
+                for slot in &mut row[..num_x_tiles as usize] {
+                    *slot = offset;
                     offset += data_list[block_idx].len() as u64 + doffset;
                     block_idx += 1;
                 }
