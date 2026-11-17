@@ -12,5 +12,5 @@ categories = ["multimedia::images", "encoding"]
 
 [dependencies]
 miniz_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/miniz_nrp" }
-zfp_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/zfp_nrp" }
+zfp_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/zfp_nrp" }
 openexr_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/openexr_nrp" }

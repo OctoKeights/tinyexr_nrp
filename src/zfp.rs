@@ -14,7 +14,7 @@
 //! least exponent) tinyexr's settings do not reach, and it is not ported.
 
 use super::Attribute;
-use zfp_nrp::{BLOCK_SIZE, BitStream, ZfpStream, decode_block_float_2, encode_block_float_2};
+use zfp_nrp::{BLOCK_LEN, BitStream, Settings};
 
 /// `TINYEXR_ZFP_COMPRESSIONTYPE_RATE`: so many bits a value.
 pub const ZFP_COMPRESSIONTYPE_RATE: i32 = 0;
@@ -165,18 +165,16 @@ pub(crate) fn zfp_param_for_writing(attributes: &[Attribute]) -> ZfpParam {
 
 /// The settings of a stream as tinyexr makes them, or none for a type of settings it does not
 /// know.
-fn zfp_stream(param: &ZfpParam) -> Option<ZfpStream> {
-    let mut zfp = ZfpStream::open();
+fn zfp_stream(param: &ZfpParam) -> Option<Settings> {
     if param.kind == ZFP_COMPRESSIONTYPE_RATE {
-        zfp.set_rate(param.rate);
+        Some(Settings::fixed_rate(param.rate))
     } else if param.kind == ZFP_COMPRESSIONTYPE_PRECISION {
-        zfp.set_precision(param.precision);
+        Some(Settings::fixed_precision(param.precision))
     } else if param.kind == ZFP_COMPRESSIONTYPE_ACCURACY {
-        zfp.set_accuracy(param.tolerance);
+        Some(Settings::fixed_accuracy(param.tolerance))
     } else {
-        return None;
+        None
     }
-    Some(zfp)
 }
 
 /// The most the port gives a stream (tinyexr allocates whatever the settings say).
@@ -191,7 +189,7 @@ pub(crate) fn zfp_stream_size(
     num_channels: usize,
 ) -> Option<usize> {
     let zfp = zfp_stream(param)?;
-    let size = zfp.maximum_size(
+    let size = zfp.max_stream_len(
         width.max(0) as usize,
         (lines as u32).wrapping_mul(num_channels as u32) as usize,
     );
@@ -224,7 +222,7 @@ pub(crate) fn compress_zfp(
     let zfp = zfp_stream(param).ok_or(ZfpRefusal::NotMultipleOfFour)?;
     let (width, num_lines) = (width as usize, num_lines as usize);
 
-    let buf_size = zfp.maximum_size(
+    let buf_size = zfp.max_stream_len(
         width,
         (num_lines as u32).wrapping_mul(num_channels as u32) as usize,
     );
@@ -245,13 +243,13 @@ pub(crate) fn compress_zfp(
         // compress 4x4 pixel block.
         for y in (0..num_lines).step_by(4) {
             for x in (0..width).step_by(4) {
-                let mut fblock = [0f32; BLOCK_SIZE];
+                let mut fblock = [0f32; BLOCK_LEN];
                 for j in 0..4 {
                     for i in 0..4 {
                         fblock[j * 4 + i] = float_at(c * image_size + ((y + j) * width + (x + i)));
                     }
                 }
-                encode_block_float_2(&zfp, &mut stream, &fblock);
+                zfp.encode_block(&mut stream, &fblock);
             }
         }
     }
@@ -295,7 +293,7 @@ pub(crate) fn decompress_zfp(
     };
     let (width, num_lines) = (dst_width as usize, dst_num_lines as usize);
 
-    let buf_size = zfp.maximum_size(
+    let buf_size = zfp.max_stream_len(
         width,
         (num_lines as u32).wrapping_mul(num_channels as u32) as usize,
     );
@@ -310,8 +308,8 @@ pub(crate) fn decompress_zfp(
         // decompress 4x4 pixel block.
         for y in (0..num_lines).step_by(4) {
             for x in (0..width).step_by(4) {
-                let mut fblock = [0f32; BLOCK_SIZE];
-                decode_block_float_2(&zfp, &mut stream, &mut fblock);
+                let mut fblock = [0f32; BLOCK_LEN];
+                zfp.decode_block(&mut stream, &mut fblock);
                 for j in 0..4 {
                     for i in 0..4 {
                         let at = 4 * (c * image_size + ((y + j) * width + (x + i)));
