@@ -7,7 +7,7 @@
 
 use std::sync::OnceLock;
 
-use super::{ChannelInfo, PIXELTYPE_FLOAT, PIXELTYPE_HALF, PIXELTYPE_UINT};
+use super::{ChannelInfo, PixelType};
 
 /// `B44HalfToFloat`.
 fn b44_half_to_float(h: u16) -> f32 {
@@ -179,7 +179,7 @@ pub(crate) fn decompress_b44(
             let ys = sampling(channel.y_sampling);
             let cw = (data_width.wrapping_add(xs).wrapping_sub(1) / xs) as usize;
             let ch = (num_lines.wrapping_add(ys).wrapping_sub(1) / ys) as usize;
-            let bpp = if channel.pixel_type == PIXELTYPE_HALF {
+            let bpp = if channel.pixel_type == PixelType::HALF {
                 2usize
             } else {
                 4
@@ -214,10 +214,10 @@ pub(crate) fn decompress_b44(
         let ch_width = data_width.wrapping_add(x_sampling).wrapping_sub(1) / x_sampling;
         let ch_height = num_lines.wrapping_add(y_sampling).wrapping_sub(1) / y_sampling;
 
-        if channel.pixel_type != PIXELTYPE_HALF {
+        if channel.pixel_type != PixelType::HALF {
             // B44 only compresses HALF; other types are stored uncompressed.
             let mut ch_bytes = (ch_width as usize).wrapping_mul(ch_height as usize);
-            if channel.pixel_type == PIXELTYPE_UINT || channel.pixel_type == PIXELTYPE_FLOAT {
+            if channel.pixel_type == PixelType::UINT || channel.pixel_type == PixelType::FLOAT {
                 ch_bytes = ch_bytes.wrapping_mul(4);
             } else {
                 ch_bytes = ch_bytes.wrapping_mul(2);
@@ -289,7 +289,7 @@ pub(crate) fn decompress_b44(
         let ch_height = num_lines.wrapping_add(y_sampling).wrapping_sub(1) / y_sampling;
         let padded_width = ((ch_width + 3) / 4) * 4;
 
-        if channel.pixel_type == PIXELTYPE_HALF {
+        if channel.pixel_type == PixelType::HALF {
             for y in 0..ch_height as usize {
                 for x in 0..ch_width as usize {
                     let val = scratch_buffers[c][y * padded_width as usize + x];
@@ -297,7 +297,7 @@ pub(crate) fn decompress_b44(
                     out_p += 2;
                 }
             }
-        } else if channel.pixel_type == PIXELTYPE_UINT || channel.pixel_type == PIXELTYPE_FLOAT {
+        } else if channel.pixel_type == PixelType::UINT || channel.pixel_type == PixelType::FLOAT {
             // The raw bytes were already range-checked above.
             let (start, size) = nonhalf[c];
             if size > 0 {
@@ -440,7 +440,7 @@ pub(crate) fn compress_b44(
     input: &[u8],
     data_width: i32,
     num_lines: i32,
-    file_types: &[i32],
+    file_types: &[PixelType],
     is_b44a: bool,
 ) -> Vec<u8> {
     // B44 compresses 4x4 blocks of HALF data: 14 bytes for a regular block, 3 bytes for a
@@ -452,9 +452,9 @@ pub(crate) fn compress_b44(
     // Calculate max output size.
     let mut max_size = 0usize;
     for &file_type in file_types {
-        if file_type == PIXELTYPE_HALF {
+        if file_type == PixelType::HALF {
             max_size += num_blocks_x as usize * num_blocks_y as usize * 14;
-        } else if file_type == PIXELTYPE_UINT || file_type == PIXELTYPE_FLOAT {
+        } else if file_type == PixelType::UINT || file_type == PixelType::FLOAT {
             max_size += pixels * 4;
         } else {
             max_size += pixels * 2;
@@ -467,10 +467,10 @@ pub(crate) fn compress_b44(
 
     // Process each channel.
     for &file_type in file_types {
-        if file_type != PIXELTYPE_HALF {
+        if file_type != PixelType::HALF {
             // Non-HALF channels: copy raw data.
             let mut ch_bytes = pixels;
-            if file_type == PIXELTYPE_UINT || file_type == PIXELTYPE_FLOAT {
+            if file_type == PixelType::UINT || file_type == PixelType::FLOAT {
                 ch_bytes *= 4;
             } else {
                 ch_bytes *= 2;

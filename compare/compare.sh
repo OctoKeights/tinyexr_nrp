@@ -9,9 +9,9 @@
 # compression (TINYEXR_USE_ZFP) against the zfp library v1.0.1 in $ZFP
 # (https://github.com/LLNL/zfp), built as its own build has it by default; with memory that
 # starts as zeros and with overflow that wraps (-fwrapv), so that the damaged files among those
-# it reads have one answer. examples/dump.rs is built from the port; both run the same made-up
+# it reads have one answer. examples/dump.rs is built from the port; both run the same synthetic
 # images for each seed and what they print is compared byte for byte. Dumps, each with a tenth
-# of [count] (200,000 by default) as the number of images or files: tinyexr_write, made-up
+# of [count] (200,000 by default) as the number of images or files: tinyexr_write, synthetic
 # images saved by both sides; tinyexr_read, images saved by tinyexr, a third of them then
 # damaged, and read four ways (the C++ side writes its files to a file, which the Rust side
 # reads); tinyexr_zfp_write and tinyexr_zfp_read, the same of images made for ZFP compression;

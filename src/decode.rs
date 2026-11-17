@@ -7,20 +7,18 @@ use super::piz::decompress_piz;
 use super::pxr24::decompress_pxr24;
 use super::zfp::{ZfpParam, decompress_zfp};
 use super::zip_rle::{decompress_rle, decompress_zip};
-use super::{
-    COMPRESSIONTYPE_B44, COMPRESSIONTYPE_B44A, COMPRESSIONTYPE_DWAA, COMPRESSIONTYPE_DWAB,
-    COMPRESSIONTYPE_NONE, COMPRESSIONTYPE_PIZ, COMPRESSIONTYPE_PXR24, COMPRESSIONTYPE_RLE,
-    COMPRESSIONTYPE_ZFP, COMPRESSIONTYPE_ZIP, COMPRESSIONTYPE_ZIPS, ChannelInfo, PIXELTYPE_FLOAT,
-    PIXELTYPE_HALF, PIXELTYPE_UINT, half_to_float,
-};
-use openexr_nrp::dwa;
+use super::{ChannelInfo, Compression, PixelType, half_to_float};
+use openexr_nrp::{PixelType as DwaPixelType, dwa};
 
 /// The values of one channel of an image or of a tile, line after line. (The original has a
 /// block of bytes for each channel, to be read as the type that was asked for.)
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChannelData {
+    /// 32-bit unsigned integers.
     Uint(Vec<u32>),
+    /// Halves, as their bits.
     Half(Vec<u16>),
+    /// Floats.
     Float(Vec<f32>),
 }
 
@@ -33,10 +31,10 @@ pub(crate) fn compute_channel_layout(channels: &[ChannelInfo]) -> Option<(Vec<us
 
     for channel in channels {
         channel_offset_list.push(channel_offset);
-        if channel.pixel_type == PIXELTYPE_HALF {
+        if channel.pixel_type == PixelType::HALF {
             pixel_data_size += 2;
             channel_offset += 2;
-        } else if channel.pixel_type == PIXELTYPE_FLOAT || channel.pixel_type == PIXELTYPE_UINT {
+        } else if channel.pixel_type == PixelType::FLOAT || channel.pixel_type == PixelType::UINT {
             pixel_data_size += 4;
             channel_offset += 4;
         } else {
@@ -54,7 +52,7 @@ pub(crate) fn compute_channel_layout(channels: &[ChannelInfo]) -> Option<(Vec<us
 /// it starts as zeros.)
 pub(crate) fn allocate_image(
     channels: &[ChannelInfo],
-    requested_pixel_types: &[i32],
+    requested_pixel_types: &[PixelType],
     data_width: i32,
     data_height: i32,
 ) -> Option<Vec<ChannelData>> {
@@ -66,20 +64,20 @@ pub(crate) fn allocate_image(
     }
 
     for (c, channel) in channels.iter().enumerate() {
-        if channel.pixel_type == PIXELTYPE_HALF {
+        if channel.pixel_type == PixelType::HALF {
             // pixel_data_size += sizeof(unsigned short);
             // channel_offset += sizeof(unsigned short);
             // Alloc internal image for half type.
-            if requested_pixel_types[c] == PIXELTYPE_HALF {
+            if requested_pixel_types[c] == PixelType::HALF {
                 images.push(ChannelData::Half(zeros(data_len)?));
-            } else if requested_pixel_types[c] == PIXELTYPE_FLOAT {
+            } else if requested_pixel_types[c] == PixelType::FLOAT {
                 images.push(ChannelData::Float(zeros(data_len)?));
             } else {
                 return None; // Unsupported
             }
-        } else if channel.pixel_type == PIXELTYPE_FLOAT {
+        } else if channel.pixel_type == PixelType::FLOAT {
             images.push(ChannelData::Float(zeros(data_len)?));
-        } else if channel.pixel_type == PIXELTYPE_UINT {
+        } else if channel.pixel_type == PixelType::UINT {
             images.push(ChannelData::Uint(zeros(data_len)?));
         } else {
             return None; // Unsupported
@@ -122,43 +120,84 @@ fn image_index(
         .wrapping_add(u)
 }
 
-/// A half from a file into a channel, as itself or as a float.
-#[inline]
-fn put_half(image: &mut ChannelData, index: usize, half: u16) -> bool {
+/// The halves of `src`, two bytes each, into consecutive places of a channel from `start`:
+/// as many as fit, and whether all of them did. (Where one does not, the per-value loop of
+/// the original stops, having written those before it.)
+fn put_halves(image: &mut ChannelData, start: usize, src: &[u8]) -> bool {
+    let (src, _) = src.as_chunks::<2>();
+    let fits = |len: usize| len.checked_sub(start).is_some_and(|room| room >= src.len());
     match image {
-        ChannelData::Half(values) => values.get_mut(index).map(|value| *value = half).is_some(),
-        ChannelData::Float(values) => values
-            .get_mut(index)
-            .map(|value| *value = half_to_float(half))
-            .is_some(),
-        ChannelData::Uint(values) => values
-            .get_mut(index)
-            .map(|value| *value = half_to_float(half).to_bits())
-            .is_some(),
+        ChannelData::Half(values) => {
+            let all = fits(values.len());
+            for (value, bytes) in values
+                .get_mut(start..)
+                .unwrap_or_default()
+                .iter_mut()
+                .zip(src)
+            {
+                *value = u16::from_le_bytes(*bytes);
+            }
+            all
+        }
+        ChannelData::Float(values) => {
+            let all = fits(values.len());
+            for (value, bytes) in values
+                .get_mut(start..)
+                .unwrap_or_default()
+                .iter_mut()
+                .zip(src)
+            {
+                *value = half_to_float(u16::from_le_bytes(*bytes));
+            }
+            all
+        }
+        ChannelData::Uint(values) => {
+            let all = fits(values.len());
+            for (value, bytes) in values
+                .get_mut(start..)
+                .unwrap_or_default()
+                .iter_mut()
+                .zip(src)
+            {
+                *value = half_to_float(u16::from_le_bytes(*bytes)).to_bits();
+            }
+            all
+        }
     }
 }
 
-/// Four bytes from a file into a channel of floats or of integers.
-#[inline]
-fn put_four(image: &mut ChannelData, index: usize, bits: u32) -> bool {
+/// The four-byte values of `src` into consecutive places of a channel of floats or of
+/// integers from `start`, as [`put_halves`] puts halves.
+fn put_fours(image: &mut ChannelData, start: usize, src: &[u8]) -> bool {
+    let (src, _) = src.as_chunks::<4>();
+    let fits = |len: usize| len.checked_sub(start).is_some_and(|room| room >= src.len());
     match image {
-        ChannelData::Uint(values) => values.get_mut(index).map(|value| *value = bits).is_some(),
-        ChannelData::Float(values) => values
-            .get_mut(index)
-            .map(|value| *value = f32::from_bits(bits))
-            .is_some(),
-        ChannelData::Half(_) => false,
+        ChannelData::Uint(values) => {
+            let all = fits(values.len());
+            for (value, bytes) in values
+                .get_mut(start..)
+                .unwrap_or_default()
+                .iter_mut()
+                .zip(src)
+            {
+                *value = u32::from_le_bytes(*bytes);
+            }
+            all
+        }
+        ChannelData::Float(values) => {
+            let all = fits(values.len());
+            for (value, bytes) in values
+                .get_mut(start..)
+                .unwrap_or_default()
+                .iter_mut()
+                .zip(src)
+            {
+                *value = f32::from_le_bytes(*bytes);
+            }
+            all
+        }
+        ChannelData::Half(_) => src.is_empty(),
     }
-}
-
-#[inline]
-fn u16_at(buf: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([buf[at], buf[at + 1]])
-}
-
-#[inline]
-fn u32_at(buf: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
 }
 
 /// What the PIZ, ZIP, RLE and PXR24 blocks of the original each end with: the lines of a
@@ -167,7 +206,7 @@ fn u32_at(buf: &[u8], at: usize) -> u32 {
 #[allow(clippy::too_many_arguments)]
 fn unpack_lines(
     out_images: &mut [ChannelData],
-    requested_pixel_types: &[i32],
+    requested_pixel_types: &[PixelType],
     out_buf: &[u8],
     line_order: i32,
     width: i32,
@@ -181,9 +220,9 @@ fn unpack_lines(
 ) -> bool {
     let width = width as usize;
     for (c, channel) in channels.iter().enumerate() {
-        let size = if channel.pixel_type == PIXELTYPE_HALF {
+        let size = if channel.pixel_type == PixelType::HALF {
             2
-        } else if channel.pixel_type == PIXELTYPE_UINT || channel.pixel_type == PIXELTYPE_FLOAT {
+        } else if channel.pixel_type == PixelType::UINT || channel.pixel_type == PixelType::FLOAT {
             if requested_pixel_types[c] != channel.pixel_type {
                 return false;
             }
@@ -193,17 +232,16 @@ fn unpack_lines(
         };
         for v in 0..num_lines as usize {
             let line_ptr = v * pixel_data_size * width + channel_offset_list[c] * width;
-            for u in 0..width {
-                let index = image_index(line_order, height, line_no, x_stride, v, u);
-                let stored = if size == 2 {
-                    put_half(&mut out_images[c], index, u16_at(out_buf, line_ptr + 2 * u))
-                } else {
-                    put_four(&mut out_images[c], index, u32_at(out_buf, line_ptr + 4 * u))
-                };
-                if !stored {
-                    // (A place outside the image: the original writes there all the same.)
-                    return false;
-                }
+            let line = &out_buf[line_ptr..line_ptr + size * width];
+            let start = image_index(line_order, height, line_no, x_stride, v, 0);
+            let stored = if size == 2 {
+                put_halves(&mut out_images[c], start, line)
+            } else {
+                put_fours(&mut out_images[c], start, line)
+            };
+            if !stored {
+                // (A place outside the image: the original writes there all the same.)
+                return false;
             }
         }
     }
@@ -231,10 +269,10 @@ fn block_size(width: i32, num_lines: i32, pixel_data_size: usize) -> Option<usiz
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_pixel_data(
     out_images: &mut [ChannelData],
-    requested_pixel_types: &[i32],
+    requested_pixel_types: &[PixelType],
     data: &[u8],
     data_len: usize,
-    compression_type: i32,
+    compression_type: Compression,
     line_order: i32,
     width: i32,
     height: i32,
@@ -249,7 +287,7 @@ pub(crate) fn decode_pixel_data(
     as_tinyexr: bool,
 ) -> bool {
     let block = &data[..data_len];
-    if compression_type == COMPRESSIONTYPE_PIZ {
+    if compression_type == Compression::PIZ {
         // PIZ
         if width == 0 || num_lines == 0 || pixel_data_size == 0 {
             // Invalid input #90
@@ -264,7 +302,7 @@ pub(crate) fn decode_pixel_data(
         let channel_sizes: Vec<usize> = channels
             .iter()
             .map(|channel| {
-                if channel.pixel_type == PIXELTYPE_HALF {
+                if channel.pixel_type == PixelType::HALF {
                     1
                 } else {
                     2
@@ -307,7 +345,7 @@ pub(crate) fn decode_pixel_data(
             channels,
             channel_offset_list,
         )
-    } else if compression_type == COMPRESSIONTYPE_ZIPS || compression_type == COMPRESSIONTYPE_ZIP {
+    } else if compression_type == Compression::ZIPS || compression_type == Compression::ZIP {
         // Allocate original data size.
         let Some(size) = block_size(width, num_lines, pixel_data_size) else {
             return false;
@@ -338,7 +376,7 @@ pub(crate) fn decode_pixel_data(
             channels,
             channel_offset_list,
         )
-    } else if compression_type == COMPRESSIONTYPE_ZFP {
+    } else if compression_type == Compression::ZFP {
         // (`decode_chunk` has found the settings; this code path should not be reachable.)
         let Some(zfp) = zfp else { return false };
 
@@ -359,27 +397,26 @@ pub(crate) fn decode_pixel_data(
         // For ZFP_COMPRESSION: the same layout as PIZ, but every channel has to be of floats.
         let width = width as usize;
         for (c, channel) in channels.iter().enumerate() {
-            if channel.pixel_type != PIXELTYPE_FLOAT || requested_pixel_types[c] != PIXELTYPE_FLOAT
+            if channel.pixel_type != PixelType::FLOAT
+                || requested_pixel_types[c] != PixelType::FLOAT
             {
                 return false;
             }
             for v in 0..num_lines as usize {
                 let line_ptr = v * pixel_data_size * width + channel_offset_list[c] * width;
-                for u in 0..width {
-                    let index = image_index(line_order, height, line_no, x_stride, v, u);
-                    if !put_four(
-                        &mut out_images[c],
-                        index,
-                        u32_at(&out_buf, line_ptr + 4 * u),
-                    ) {
-                        // (A place outside the image: the original writes there all the same.)
-                        return false;
-                    }
+                let start = image_index(line_order, height, line_no, x_stride, v, 0);
+                if !put_fours(
+                    &mut out_images[c],
+                    start,
+                    &out_buf[line_ptr..line_ptr + 4 * width],
+                ) {
+                    // (A place outside the image: the original writes there all the same.)
+                    return false;
                 }
             }
         }
         true
-    } else if compression_type == COMPRESSIONTYPE_RLE {
+    } else if compression_type == Compression::RLE {
         // Allocate original data size.
         let Some(size) = block_size(width, num_lines, pixel_data_size) else {
             return false;
@@ -409,7 +446,7 @@ pub(crate) fn decode_pixel_data(
             channels,
             channel_offset_list,
         )
-    } else if compression_type == COMPRESSIONTYPE_PXR24 {
+    } else if compression_type == Compression::PXR24 {
         // PXR24 compression.
         // Allocate original data size.
         // (A block of no bytes stops the original, with an exception out of a C function.)
@@ -437,7 +474,8 @@ pub(crate) fn decode_pixel_data(
         }
         let mut out_buf = vec![0u8; size];
 
-        let pixel_types: Vec<i32> = channels.iter().map(|channel| channel.pixel_type).collect();
+        let pixel_types: Vec<PixelType> =
+            channels.iter().map(|channel| channel.pixel_type).collect();
         if !decompress_pxr24(
             &mut out_buf,
             block,
@@ -464,7 +502,7 @@ pub(crate) fn decode_pixel_data(
             channels,
             channel_offset_list,
         )
-    } else if compression_type == COMPRESSIONTYPE_B44 || compression_type == COMPRESSIONTYPE_B44A {
+    } else if compression_type == Compression::B44 || compression_type == Compression::B44A {
         // B44/B44A compression.
         // B44 output is always HALF (2 bytes per channel per pixel).
         // Calculate B44 output size (HALF channels stay as HALF, others as-is).
@@ -475,7 +513,7 @@ pub(crate) fn decode_pixel_data(
             let ys = sampling(channel.y_sampling);
             let cw = (width.wrapping_add(xs).wrapping_sub(1) / xs) as isize as usize;
             let ch = (num_lines.wrapping_add(ys).wrapping_sub(1) / ys) as isize as usize;
-            let bpp = if channel.pixel_type == PIXELTYPE_HALF {
+            let bpp = if channel.pixel_type == PixelType::HALF {
                 2usize
             } else {
                 4
@@ -519,42 +557,39 @@ pub(crate) fn decode_pixel_data(
             let ys = sampling(channel.y_sampling);
             let ch_width = (width.wrapping_add(xs).wrapping_sub(1) / xs) as usize;
             let ch_height = (num_lines.wrapping_add(ys).wrapping_sub(1) / ys) as usize;
-            let ch_bytes = if channel.pixel_type == PIXELTYPE_HALF {
+            let ch_bytes = if channel.pixel_type == PixelType::HALF {
                 2
             } else {
                 4
             };
 
-            if channel.pixel_type == PIXELTYPE_HALF {
+            if channel.pixel_type == PixelType::HALF {
                 for v in 0..ch_height {
                     let line_ptr = ch_offset + v * ch_width * 2;
-                    for u in 0..ch_width {
-                        let index = image_index(line_order, height, line_no, x_stride, v, u);
-                        if !put_half(
-                            &mut out_images[c],
-                            index,
-                            u16_at(&out_buf, line_ptr + 2 * u),
-                        ) {
-                            return false;
-                        }
+                    let start = image_index(line_order, height, line_no, x_stride, v, 0);
+                    if !put_halves(
+                        &mut out_images[c],
+                        start,
+                        &out_buf[line_ptr..line_ptr + 2 * ch_width],
+                    ) {
+                        return false;
                     }
                 }
-            } else if channel.pixel_type == PIXELTYPE_UINT || channel.pixel_type == PIXELTYPE_FLOAT
+            } else if channel.pixel_type == PixelType::UINT
+                || channel.pixel_type == PixelType::FLOAT
             {
                 if requested_pixel_types[c] != channel.pixel_type {
                     return false;
                 }
                 for v in 0..ch_height {
                     let line_ptr = ch_offset + v * ch_width * 4;
-                    for u in 0..ch_width {
-                        let index = image_index(line_order, height, line_no, x_stride, v, u);
-                        if !put_four(
-                            &mut out_images[c],
-                            index,
-                            u32_at(&out_buf, line_ptr + 4 * u),
-                        ) {
-                            return false;
-                        }
+                    let start = image_index(line_order, height, line_no, x_stride, v, 0);
+                    if !put_fours(
+                        &mut out_images[c],
+                        start,
+                        &out_buf[line_ptr..line_ptr + 4 * ch_width],
+                    ) {
+                        return false;
                     }
                 }
             } else {
@@ -565,7 +600,7 @@ pub(crate) fn decode_pixel_data(
         }
         true
     } else if !as_tinyexr
-        && (compression_type == COMPRESSIONTYPE_DWAA || compression_type == COMPRESSIONTYPE_DWAB)
+        && (compression_type == Compression::DWAA || compression_type == Compression::DWAB)
     {
         // (Not in the original.) A block as long as its pixels is its pixels.
         let Some(size) = block_size(width, num_lines, pixel_data_size).filter(|&size| size != 0)
@@ -596,13 +631,19 @@ pub(crate) fn decode_pixel_data(
         let dwa_channels: Vec<dwa::Channel> = channels
             .iter()
             .zip(&names)
-            .map(|(channel, name)| dwa::Channel {
-                name,
-                pixel_type: channel.pixel_type,
-                p_linear: channel.p_linear != 0,
+            .map(|(channel, name)| {
+                Some(dwa::Channel {
+                    name,
+                    pixel_type: DwaPixelType::from_code(channel.pixel_type.0)?,
+                    linear: channel.p_linear != 0,
+                })
             })
-            .collect();
-        if dwa::uncompress(
+            .collect::<Option<_>>()
+            .unwrap_or_default();
+        if dwa_channels.len() != channels.len() {
+            return false;
+        }
+        if dwa::decompress(
             block,
             &dwa_channels,
             width as usize,
@@ -627,7 +668,7 @@ pub(crate) fn decode_pixel_data(
             channels,
             channel_offset_list,
         )
-    } else if compression_type == COMPRESSIONTYPE_NONE {
+    } else if compression_type == Compression::NONE {
         let width_size = width.max(0) as usize;
         for (c, channel) in channels.iter().enumerate() {
             for v in 0..num_lines.max(0) as usize {
@@ -638,25 +679,17 @@ pub(crate) fn decode_pixel_data(
                 // (Here the line is `y`, not `line_no`.)
                 let out_line = image_index(line_order, height, y, x_stride, v, 0);
 
-                if channel.pixel_type == PIXELTYPE_HALF {
-                    if requested_pixel_types[c] == PIXELTYPE_HALF {
+                if channel.pixel_type == PixelType::HALF {
+                    if requested_pixel_types[c] == PixelType::HALF {
                         // (No look at whether the line is all within the block: the
                         // original reads on into what follows it in the file.)
-                        for u in 0..width_size {
-                            let at = line_ptr.wrapping_add(2 * u);
-                            if at.checked_add(2).is_none_or(|end| end > data.len()) {
-                                // (Past the end of the file, which the original reads too.)
-                                return false;
-                            }
-                            if !put_half(
-                                &mut out_images[c],
-                                out_line.wrapping_add(u),
-                                u16_at(data, at),
-                            ) {
-                                return false;
-                            }
+                        // (Past the end of the file, which the original reads too, the line stops.)
+                        let in_file = data.len().saturating_sub(line_ptr) / 2;
+                        let line = &data[line_ptr.min(data.len())..][..2 * width_size.min(in_file)];
+                        if !put_halves(&mut out_images[c], out_line, line) || in_file < width_size {
+                            return false;
                         }
-                    } else if requested_pixel_types[c] == PIXELTYPE_FLOAT {
+                    } else if requested_pixel_types[c] == PixelType::FLOAT {
                         if line_ptr
                             .checked_add(2 * width_size)
                             .is_none_or(|end| end > data_len)
@@ -665,21 +698,15 @@ pub(crate) fn decode_pixel_data(
                             return false;
                         }
 
-                        for u in 0..width_size {
-                            // address may not be aligned. use byte-wise copy for safety. #76
-                            if !put_half(
-                                &mut out_images[c],
-                                out_line.wrapping_add(u),
-                                u16_at(data, line_ptr + 2 * u),
-                            ) {
-                                return false;
-                            }
+                        let line = &data[line_ptr..line_ptr + 2 * width_size];
+                        if !put_halves(&mut out_images[c], out_line, line) {
+                            return false;
                         }
                     } else {
                         return false;
                     }
-                } else if channel.pixel_type == PIXELTYPE_FLOAT
-                    || channel.pixel_type == PIXELTYPE_UINT
+                } else if channel.pixel_type == PixelType::FLOAT
+                    || channel.pixel_type == PixelType::UINT
                 {
                     if line_ptr
                         .checked_add(4 * width_size)
@@ -689,14 +716,9 @@ pub(crate) fn decode_pixel_data(
                         return false;
                     }
 
-                    for u in 0..width_size {
-                        if !put_four(
-                            &mut out_images[c],
-                            out_line.wrapping_add(u),
-                            u32_at(data, line_ptr + 4 * u),
-                        ) {
-                            return false;
-                        }
+                    let line = &data[line_ptr..line_ptr + 4 * width_size];
+                    if !put_fours(&mut out_images[c], out_line, line) {
+                        return false;
                     }
                 }
             }
@@ -715,10 +737,10 @@ pub(crate) fn decode_tiled_pixel_data(
     out_images: &mut [ChannelData],
     width: &mut i32,
     height: &mut i32,
-    requested_pixel_types: &[i32],
+    requested_pixel_types: &[PixelType],
     data: &[u8],
     data_len: usize,
-    compression_type: i32,
+    compression_type: Compression,
     data_width: i32,
     data_height: i32,
     tile_offset_x: i32,

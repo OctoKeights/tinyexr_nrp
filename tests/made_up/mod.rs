@@ -1,4 +1,4 @@
-//! Made-up data, the same from a seed here as in the C side of the comparison
+//! Synthetic data, the same from a seed here as in the C side of the comparison
 //! (`compare/`), and the dumps the tests run as well as the comparison (`examples/dump.rs`).
 
 // (The arithmetic is written as the C side has it; not every user of this module uses all of
@@ -92,7 +92,8 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
         *at += 4;
         value
     };
-    fn add_number(hash: &mut Hash, value: i32) {
+    fn add_number(hash: &mut Hash, value: impl Into<i32>) {
+        let value: i32 = value.into();
         hash.add(&value.to_le_bytes());
     }
     // A name with its end, or a mark in its place where it was not UTF-8.
@@ -131,7 +132,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
     }
     // The file as floats of red, green, blue and alpha.
     fn continue_with_rgba(hash: &mut Hash, wish: usize, bytes: &[u8], as_rgba: &mut u32) {
-        let loaded = tinyexr::load_exr_from_memory_as_tinyexr(bytes);
+        let loaded = tinyexr::load_rgba_as_tinyexr(bytes);
         if wish & 8 != 0 {
             hash.add(&0xfffffffcu32.to_le_bytes());
             if loaded.is_ok() {
@@ -141,7 +142,11 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
         }
         match loaded {
             Err(error) => add_error(hash, &error),
-            Ok((rgba, width, height)) => {
+            Ok(tinyexr::RgbaImage {
+                width,
+                height,
+                data: rgba,
+            }) => {
                 add_number(hash, 0);
                 add_message(hash, "");
                 *as_rgba += 1;
@@ -164,7 +169,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
         hash.add(bytes);
 
         let mut large = false;
-        match tinyexr::parse_exr_version_from_memory(bytes) {
+        match tinyexr::parse_version(bytes) {
             Err(code) => add_number(&mut hash, code),
             Ok(version) => {
                 add_number(&mut hash, 0);
@@ -174,7 +179,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
                 add_number(&mut hash, i32::from(version.non_image));
                 add_number(&mut hash, i32::from(version.multipart));
 
-                match tinyexr::parse_exr_header_from_memory_as_tinyexr(&version, bytes) {
+                match tinyexr::parse_header_as_tinyexr(&version, bytes) {
                     Err(error) => add_error(&mut hash, &error),
                     Ok(mut header) => {
                         add_number(&mut hash, 0);
@@ -230,16 +235,15 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
                             // the length of a block, past the end of the file.)
                             if wish & 1 != 0
                                 || (wish & 2 != 0
-                                    && header.compression_type == tinyexr::COMPRESSIONTYPE_NONE)
+                                    && header.compression_type == tinyexr::Compression::NONE)
                             {
                                 for c in 0..header.channels.len() {
-                                    if header.pixel_types[c] == tinyexr::PIXELTYPE_HALF {
-                                        header.requested_pixel_types[c] = tinyexr::PIXELTYPE_FLOAT;
+                                    if header.pixel_types[c] == tinyexr::PixelType::HALF {
+                                        header.requested_pixel_types[c] = tinyexr::PixelType::FLOAT;
                                     }
                                 }
                             }
-                            let loaded =
-                                tinyexr::load_exr_image_from_memory_as_tinyexr(&mut header, bytes);
+                            let loaded = tinyexr::load_image_as_tinyexr(&mut header, bytes);
                             match (wish & 4 != 0, loaded) {
                                 // Where tinyexr stops (it throws, and nothing catches it),
                                 // the port has to refuse the file.
@@ -309,7 +313,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
     )
 }
 
-/// A made-up image and how to save it, as `MakeImage` in `compare/dump_tinyexr.cc` makes it.
+/// A synthetic image and how to save it, as `MakeImage` in `compare/dump_tinyexr.cc` makes it.
 struct ExrMade {
     header: tinyexr_nrp::ExrHeader,
     image: tinyexr_nrp::ExrImage,
@@ -320,8 +324,13 @@ struct ExrMade {
 
 /// The values of one channel, `w` by `h` of them, of one of four kinds: noise, a ramp, one
 /// value, values such as a picture has. (`MakeValues`.)
-fn exr_values(r: &mut Random, pixel_type: i32, w: i32, h: i32) -> tinyexr_nrp::ChannelData {
-    use tinyexr_nrp::{ChannelData, PIXELTYPE_FLOAT, PIXELTYPE_HALF};
+fn exr_values(
+    r: &mut Random,
+    pixel_type: tinyexr_nrp::PixelType,
+    w: i32,
+    h: i32,
+) -> tinyexr_nrp::ChannelData {
+    use tinyexr_nrp::{ChannelData, PixelType};
     let kind = r.next() % 4;
     let first = r.next();
     let step_x = r.next() % 8;
@@ -337,9 +346,9 @@ fn exr_values(r: &mut Random, pixel_type: i32, w: i32, h: i32) -> tinyexr_nrp::C
                 2 => first,
                 _ => {
                     let n = r.next();
-                    if pixel_type == PIXELTYPE_FLOAT {
+                    if pixel_type == PixelType::FLOAT {
                         0x3c000000 + n % 0x04000000
-                    } else if pixel_type == PIXELTYPE_HALF {
+                    } else if pixel_type == PixelType::HALF {
                         0x3000 + n % 0x1000
                     } else {
                         n % 1000
@@ -348,9 +357,9 @@ fn exr_values(r: &mut Random, pixel_type: i32, w: i32, h: i32) -> tinyexr_nrp::C
             });
         }
     }
-    if pixel_type == PIXELTYPE_FLOAT {
+    if pixel_type == PixelType::FLOAT {
         ChannelData::Float(values.into_iter().map(f32::from_bits).collect())
-    } else if pixel_type == PIXELTYPE_HALF {
+    } else if pixel_type == PixelType::HALF {
         ChannelData::Half(values.into_iter().map(|value| value as u16).collect())
     } else {
         ChannelData::Uint(values)
@@ -387,7 +396,7 @@ fn exr_zfp_double(r: &mut Random, tolerance: bool, many: bool) -> f64 {
     }
 }
 
-/// A made-up image (`MakeImage`); for ZFP compression (`g_zfp`), of floats, most of them of
+/// A synthetic image (`MakeImage`); for ZFP compression (`g_zfp`), of floats, most of them of
 /// whole blocks of four by four, with the attributes of ZFP's settings.
 fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
     use tinyexr_nrp::{
@@ -451,17 +460,17 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
             // Floats, halves or integers handed over, stored as floats, now and then not.
             let kind = r.next() % 16;
             let memory_type = if kind < 10 {
-                tinyexr::PIXELTYPE_FLOAT
+                tinyexr::PixelType::FLOAT
             } else if kind < 15 {
-                tinyexr::PIXELTYPE_HALF
+                tinyexr::PixelType::HALF
             } else {
-                tinyexr::PIXELTYPE_UINT
+                tinyexr::PixelType::UINT
             };
             let as_half = r.next().is_multiple_of(24);
-            let file_type = if as_half && memory_type != tinyexr::PIXELTYPE_UINT {
-                tinyexr::PIXELTYPE_HALF
+            let file_type = if as_half && memory_type != tinyexr::PixelType::UINT {
+                tinyexr::PixelType::HALF
             } else {
-                tinyexr::PIXELTYPE_FLOAT
+                tinyexr::PixelType::FLOAT
             };
             header.channels.push(ChannelInfo {
                 name: name.to_string(),
@@ -474,14 +483,14 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
             header.requested_pixel_types.push(file_type);
             continue;
         }
-        let memory_type = (r.next() % 3) as i32;
+        let memory_type = tinyexr::PixelType((r.next() % 3) as i32);
         let as_half = r.next() % 2;
-        let file_type = if memory_type == tinyexr::PIXELTYPE_UINT {
-            tinyexr::PIXELTYPE_UINT
+        let file_type = if memory_type == tinyexr::PixelType::UINT {
+            tinyexr::PixelType::UINT
         } else if as_half != 0 {
-            tinyexr::PIXELTYPE_HALF
+            tinyexr::PixelType::HALF
         } else {
-            tinyexr::PIXELTYPE_FLOAT
+            tinyexr::PixelType::FLOAT
         };
         header.channels.push(ChannelInfo {
             name: name.to_string(),
@@ -497,17 +506,17 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
     // Its compression: one of the eight, PIZ more often; now and then one that is not written.
     let compression = r.next() % 20;
     header.compression_type = if compression < 16 {
-        (compression % 8) as i32
+        tinyexr_nrp::Compression((compression % 8) as i32)
     } else if compression == 16 {
-        tinyexr::COMPRESSIONTYPE_ZFP
+        tinyexr::Compression::ZFP
     } else if compression == 17 {
-        9
+        tinyexr_nrp::Compression(9)
     } else {
-        tinyexr::COMPRESSIONTYPE_PIZ
+        tinyexr::Compression::PIZ
     };
     if zfp {
-        header.compression_type = tinyexr::COMPRESSIONTYPE_ZFP;
-    } else if header.compression_type == tinyexr::COMPRESSIONTYPE_ZFP {
+        header.compression_type = tinyexr::Compression::ZFP;
+    } else if header.compression_type == tinyexr::Compression::ZFP {
         // (A ZFP file without the attributes of its settings, as these other images are, is
         // written, at 2 bits a value, and not read.)
         plain = false;
@@ -665,12 +674,12 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
                 .push(exr_values(r, header.pixel_types[c], width, height));
         }
         let lines = match header.compression_type {
-            tinyexr::COMPRESSIONTYPE_ZIP
-            | tinyexr::COMPRESSIONTYPE_PXR24
-            | tinyexr::COMPRESSIONTYPE_ZFP => 16,
-            tinyexr::COMPRESSIONTYPE_PIZ
-            | tinyexr::COMPRESSIONTYPE_B44
-            | tinyexr::COMPRESSIONTYPE_B44A => 32,
+            tinyexr::Compression::ZIP | tinyexr::Compression::PXR24 | tinyexr::Compression::ZFP => {
+                16
+            }
+            tinyexr::Compression::PIZ | tinyexr::Compression::B44 | tinyexr::Compression::B44A => {
+                32
+            }
             _ => 1,
         };
         set_chunk_count(&mut header, ((height + lines - 1) / lines) as u32);
@@ -690,15 +699,15 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
         header.tile_size_y = (header.tile_size_y + 3) & !3;
     }
     header.tile_level_mode = if zfp && !r.next().is_multiple_of(4) {
-        tinyexr::TILE_ONE_LEVEL
+        tinyexr::TileLevelMode::ONE_LEVEL
     } else {
-        (r.next() % 3) as i32
+        tinyexr_nrp::TileLevelMode((r.next() % 3) as i32)
     };
-    header.tile_rounding_mode = (r.next() % 2) as i32;
+    header.tile_rounding_mode = tinyexr_nrp::TileRoundingMode((r.next() % 2) as i32);
     let without_last_level = r.next().is_multiple_of(16);
 
     // Its levels, as tinyexr counts them.
-    let levels = tinyexr::tile_levels(&header).expect("the levels of a made-up image");
+    let levels = tinyexr::tile_levels(&header).expect("the levels of a synthetic image");
     let mut images = Vec::new();
     let mut chunks = 0u32;
     for level in &levels {
@@ -756,7 +765,7 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
     }
 }
 
-/// The `tinyexr_write` dumps: made-up images saved, as `compare/dump_tinyexr.cc` saves them
+/// The `tinyexr_write` dumps: synthetic images saved, as `compare/dump_tinyexr.cc` saves them
 /// with tinyexr: a hash of each file's bytes, or of the message where none is saved. Each
 /// file is read back besides, which the other program does not do: what was saved as it was
 /// has to come back as it was.
@@ -778,14 +787,14 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
     }
     for i in 0..count {
         let made = exr_image(&mut r, small, name.starts_with("tinyexr_zfp"));
-        match tinyexr::save_exr_image_to_memory_as_tinyexr(&made.image, &made.header) {
+        match tinyexr::save_image_as_tinyexr(&made.image, &made.header) {
             Err(error) => {
                 not_saved += 1;
                 // (What tinyexr gives as the size: nothing, or one of its error numbers.)
-                let refusal = if error.code == tinyexr::ERROR_SERIALIZATION_FAILED {
+                let refusal = if error.code == tinyexr::ErrorCode::SERIALIZATION_FAILED {
                     0
                 } else {
-                    error.code
+                    error.code.0
                 };
                 hash.add(&refusal.to_le_bytes());
                 hash.add(error.message.as_bytes());
@@ -802,29 +811,27 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
                     // unless a PXR24 or B44 block did not come out smaller than its pixels.
                     let lossy_blocks = matches!(
                         made.header.compression_type,
-                        tinyexr::COMPRESSIONTYPE_PXR24
-                            | tinyexr::COMPRESSIONTYPE_B44
-                            | tinyexr::COMPRESSIONTYPE_B44A
+                        tinyexr::Compression::PXR24
+                            | tinyexr::Compression::B44
+                            | tinyexr::Compression::B44A
                     );
                     let file = if lossy_blocks {
-                        tinyexr::save_exr_image_to_memory(&made.image, &made.header).unwrap_or_else(
-                            |error| {
-                                panic!("{name}: file {i} is not saved the other way: {error:?}")
-                            },
-                        )
+                        tinyexr::save_image(&made.image, &made.header).unwrap_or_else(|error| {
+                            panic!("{name}: file {i} is not saved the other way: {error:?}")
+                        })
                     } else {
                         file
                     };
-                    let version = tinyexr::parse_exr_version_from_memory(&file)
-                        .unwrap_or_else(|code| panic!("{name}: file {i} is not read back: {code}"));
-                    let mut header = tinyexr::parse_exr_header_from_memory(&version, &file)
-                        .unwrap_or_else(|error| {
+                    let version = tinyexr::parse_version(&file).unwrap_or_else(|code| {
+                        panic!("{name}: file {i} is not read back: {code:?}")
+                    });
+                    let mut header =
+                        tinyexr::parse_header(&version, &file).unwrap_or_else(|error| {
                             panic!("{name}: file {i} is not read back: {error:?}")
                         });
-                    let read = tinyexr::load_exr_image_from_memory(&mut header, &file)
-                        .unwrap_or_else(|error| {
-                            panic!("{name}: file {i} is not read back: {error:?}")
-                        });
+                    let read = tinyexr::load_image(&mut header, &file).unwrap_or_else(|error| {
+                        panic!("{name}: file {i} is not read back: {error:?}")
+                    });
                     // A channel stored as the type it had, by a compression that loses
                     // nothing of that type, comes back bit for bit.
                     let comp = made.header.compression_type;
@@ -838,12 +845,12 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
                         for c in 0..made.header.channels.len() {
                             let file_type = made.header.requested_pixel_types[c];
                             let kept = made.header.pixel_types[c] == file_type
-                                && comp != tinyexr::COMPRESSIONTYPE_ZFP
-                                && !(comp == tinyexr::COMPRESSIONTYPE_PXR24
-                                    && file_type == tinyexr::PIXELTYPE_FLOAT)
-                                && !((comp == tinyexr::COMPRESSIONTYPE_B44
-                                    || comp == tinyexr::COMPRESSIONTYPE_B44A)
-                                    && file_type == tinyexr::PIXELTYPE_HALF);
+                                && comp != tinyexr::Compression::ZFP
+                                && !(comp == tinyexr::Compression::PXR24
+                                    && file_type == tinyexr::PixelType::FLOAT)
+                                && !((comp == tinyexr::Compression::B44
+                                    || comp == tinyexr::Compression::B44A)
+                                    && file_type == tinyexr::PixelType::HALF);
                             if !kept {
                                 continue;
                             }
@@ -898,24 +905,28 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
             let width = 1 + (r.next() % 40) as i32;
             let height = 1 + (r.next() % 40) as i32;
             let as_halves = r.next() % 2 != 0;
-            let ChannelData::Float(floats) =
-                exr_values(&mut r, tinyexr::PIXELTYPE_FLOAT, width * components, height)
-            else {
+            let ChannelData::Float(floats) = exr_values(
+                &mut r,
+                tinyexr::PixelType::FLOAT,
+                width * components,
+                height,
+            ) else {
                 unreachable!()
             };
-            match tinyexr::save_exr_to_memory(&floats, width, height, components, as_halves) {
+            match tinyexr::save_floats(&floats, width, height, components, as_halves) {
                 Ok(file) => {
                     short_way += 1;
                     file_total += file.len() as u64;
                     hash.add(&(file.len() as u32).to_le_bytes());
                     hash.add(&file);
                     // And back: the floats, or the halves of them.
-                    let (rgba, read_width, read_height) = tinyexr::load_exr_from_memory(&file)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "{name}: file {i}, saved the short way, is not read back: {error:?}"
-                            )
-                        });
+                    let tinyexr::RgbaImage {
+                        width: read_width,
+                        height: read_height,
+                        data: rgba,
+                    } = tinyexr::load_rgba(&file).unwrap_or_else(|error| {
+                        panic!("{name}: file {i}, saved the short way, is not read back: {error:?}")
+                    });
                     assert_eq!((read_width, read_height), (width, height));
                     if !as_halves {
                         for pixel in 0..(width * height) as usize {
@@ -932,7 +943,7 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
                     }
                 }
                 Err(error) => {
-                    hash.add(&error.code.to_le_bytes());
+                    hash.add(&error.code.0.to_le_bytes());
                     hash.add(error.message.as_bytes());
                     hash.add(&[0]);
                 }
@@ -949,7 +960,8 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
 }
 
 /// A number into a hash, as `AddNumber` in `compare/dump_tinyexr.cc` puts it.
-fn exr_add_number(hash: &mut Hash, value: i32) {
+fn exr_add_number(hash: &mut Hash, value: impl Into<i32>) {
+    let value: i32 = value.into();
     hash.add(&value.to_le_bytes());
 }
 
@@ -964,7 +976,7 @@ fn exr_add_name(hash: &mut Hash, text: &str) {
 }
 
 /// An error's number and message, or a mark where it has none (`AddMessage2`).
-fn exr_add_error(hash: &mut Hash, code: i32, message: &str) {
+fn exr_add_error(hash: &mut Hash, code: impl Into<i32>, message: &str) {
     exr_add_number(hash, code);
     if message.is_empty() {
         hash.add(&0xfffffffeu32.to_le_bytes());
@@ -1098,7 +1110,7 @@ enum ExrEnd {
 /// The reading of a file of many parts, as `ReadParts` does it.
 fn exr_read_parts(hash: &mut Hash, bytes: &[u8], wish: u32) -> ExrEnd {
     use tinyexr_nrp::{self as tinyexr, PAST_THE_END};
-    let version = match tinyexr::parse_exr_version_from_memory(bytes) {
+    let version = match tinyexr::parse_version(bytes) {
         Err(code) => {
             exr_add_number(hash, code);
             return ExrEnd::Error;
@@ -1111,15 +1123,14 @@ fn exr_read_parts(hash: &mut Hash, bytes: &[u8], wish: u32) -> ExrEnd {
     exr_add_number(hash, i32::from(version.long_name));
     exr_add_number(hash, i32::from(version.non_image));
     exr_add_number(hash, i32::from(version.multipart));
-    let mut headers =
-        match tinyexr::parse_exr_multipart_header_from_memory_as_tinyexr(&version, bytes) {
-            Err(error) if error.message == PAST_THE_END => return ExrEnd::PastTheEnd,
-            Err(error) => {
-                exr_add_error(hash, error.code, &error.message);
-                return ExrEnd::Error;
-            }
-            Ok(headers) => headers,
-        };
+    let mut headers = match tinyexr::parse_multipart_headers_as_tinyexr(&version, bytes) {
+        Err(error) if error.message == PAST_THE_END => return ExrEnd::PastTheEnd,
+        Err(error) => {
+            exr_add_error(hash, error.code, &error.message);
+            return ExrEnd::Error;
+        }
+        Ok(headers) => headers,
+    };
     exr_add_error(hash, 0, "");
     exr_add_number(hash, headers.len() as i32);
     let mut left = headers.len() > 64;
@@ -1136,13 +1147,13 @@ fn exr_read_parts(hash: &mut Hash, bytes: &[u8], wish: u32) -> ExrEnd {
     for (i, header) in headers.iter_mut().enumerate() {
         if i < 32 && (wish >> i) & 1 != 0 {
             for c in 0..header.channels.len() {
-                if header.pixel_types[c] == tinyexr::PIXELTYPE_HALF {
-                    header.requested_pixel_types[c] = tinyexr::PIXELTYPE_FLOAT;
+                if header.pixel_types[c] == tinyexr::PixelType::HALF {
+                    header.requested_pixel_types[c] = tinyexr::PixelType::FLOAT;
                 }
             }
         }
     }
-    match tinyexr::load_exr_multipart_image_from_memory_as_tinyexr(&mut headers, bytes) {
+    match tinyexr::load_multipart_images_as_tinyexr(&mut headers, bytes) {
         Err(error) if error.message == PAST_THE_END => ExrEnd::PastTheEnd,
         Err(error) => {
             exr_add_error(hash, error.code, &error.message);
@@ -1202,13 +1213,13 @@ pub fn tinyexr_parts(name: &str, seed: u64, count: u32, file: &[u8]) -> String {
             .iter()
             .map(|made| (&made.image, &made.header))
             .collect();
-        match tinyexr::save_exr_multipart_image_to_memory_as_tinyexr(&list) {
+        match tinyexr::save_multipart_images_as_tinyexr(&list) {
             Err(error) => {
                 not_saved += 1;
-                let refusal = if error.code == tinyexr::ERROR_SERIALIZATION_FAILED {
+                let refusal = if error.code == tinyexr::ErrorCode::SERIALIZATION_FAILED {
                     0
                 } else {
-                    error.code
+                    error.code.0
                 };
                 hash.add(&refusal.to_le_bytes());
                 hash.add(error.message.as_bytes());
@@ -1274,7 +1285,7 @@ pub fn tinyexr_deep(name: &str, count: u32, file: &[u8]) -> String {
             hash.add(&4u32.to_le_bytes());
         } else {
             let mut read = Hash::new();
-            let end = match tinyexr::load_deep_exr_from_memory(bytes) {
+            let end = match tinyexr::load_deep(bytes) {
                 Err(error) if error.message == PAST_THE_END => ExrEnd::PastTheEnd,
                 Err(error) => {
                     exr_add_error(&mut read, error.code, &error.message);

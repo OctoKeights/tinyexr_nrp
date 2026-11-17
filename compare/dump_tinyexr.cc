@@ -1,9 +1,9 @@
 // The C++ half of the comparison with tinyexr (https://github.com/syoyo/tinyexr): makes .exr
-// files of made-up pixels with it, reads them back with it, and prints a running hash of the
+// files of synthetic pixels with it, reads them back with it, and prints a running hash of the
 // files or of what it reads. examples/dump.rs prints the same from the Rust port, and
 // compare/compare.sh compares the two.
 //
-//   dump tinyexr_write <seed> <count>         made-up images of every kind tinyexr writes
+//   dump tinyexr_write <seed> <count>         synthetic images of every kind tinyexr writes
 //   dump tinyexr_write_small <seed> <count>   (scanlines and tiles, with mip and rip levels,
 //                                             three types of value, eight compressions, with
 //                                             attributes of their own), saved: the bytes of
@@ -19,13 +19,13 @@
 //                                              and with ones past the end (to the file, with
 //                                              whether that made a difference, or stopped
 //                                              tinyexr)
-//   dump tinyexr_deep <seed> <count> <file>    made-up deep files of scanlines and of tiles,
+//   dump tinyexr_deep <seed> <count> <file>    synthetic deep files of scanlines and of tiles,
 //                                              a third of them damaged, read the same way
 //   dump tinyexr_zfp_write <seed> <count>        as tinyexr_write and tinyexr_read, of images
 //   dump tinyexr_zfp_read <seed> <count> <file>  made for ZFP compression: of floats, most of
 //                                                whole blocks of four by four, with the
 //                                                attributes of its settings
-//   dump tinyexr_read <seed> <count> <file>         made-up images of every kind tinyexr writes
+//   dump tinyexr_read <seed> <count> <file>         synthetic images of every kind tinyexr writes
 //   dump tinyexr_read_small <seed> <count> <file>   (scanlines and tiles, with mip and rip
 //                                                   levels, three types of value, eight
 //                                                   compressions), saved; now and then the
@@ -331,7 +331,7 @@ struct Level
     std::vector<std::vector<std::vector<unsigned char>>> tiles; // of each tile, of each channel
 };
 
-// A made-up image and how to save it.
+// A synthetic image and how to save it.
 struct Made
 {
     int width = 0, height = 0;
@@ -633,7 +633,7 @@ Made MakeImage(bool small)
     std::vector<int> num_x_tiles, num_y_tiles;
     if (!tinyexr::PrecalculateTileInfo(num_x_tiles, num_y_tiles, &header))
     {
-        std::fprintf(stderr, "tinyexr does not count the tiles of a made-up image\n");
+        std::fprintf(stderr, "tinyexr does not count the tiles of a synthetic image\n");
         std::exit(2);
     }
     const int levels_x = static_cast<int>(num_x_tiles.size());
@@ -666,7 +666,7 @@ Made MakeImage(bool small)
     return m;
 }
 
-// A made-up image as tinyexr's writer takes it: its header, and its first level (which leads to
+// A synthetic image as tinyexr's writer takes it: its header, and its first level (which leads to
 // the others).
 struct Prepared
 {
@@ -1621,8 +1621,8 @@ int Parts(const char* name, std::uint32_t count, std::FILE* out)
             Add(file.data(), file.size());
         }
 
-        // A third damaged: bits turned over, the end cut off, a byte made up, a byte of the
-        // headers made zero, an offset or the part number of a block made up.
+        // A third damaged: bits turned over, the end cut off, a byte randomised, a byte of the
+        // headers made zero, an offset or the part number of a block randomised.
         const std::uint32_t wish = Next2();
         if (!file.empty() && Next2() % 3 == 0)
         {
@@ -1725,7 +1725,7 @@ std::vector<unsigned char> Pack(int compression, const std::vector<unsigned char
     return packed;
 }
 
-// A made-up deep image (tinyexr reads them, and does not write them): of scanlines, a block
+// A synthetic deep image (tinyexr reads them, and does not write them): of scanlines, a block
 // a line (as tinyexr takes them, whatever the compression says), or of tiles of one level;
 // one to three channels of any type; up to three samples a pixel, now and then many.
 std::vector<unsigned char> MakeDeep()
@@ -1937,7 +1937,7 @@ void ReadDeep(const char* path, std::size_t size, unsigned char pad)
     }
 }
 
-// The `tinyexr_deep` dump: made-up deep files, a third of them damaged, each read in a
+// The `tinyexr_deep` dump: synthetic deep files, a third of them damaged, each read in a
 // program of its own, with zeros and with ones outside it, and written to the file of files
 // with what came of it.
 int Deep(const char* name, std::uint32_t count, std::FILE* out)
@@ -1949,7 +1949,7 @@ int Deep(const char* name, std::uint32_t count, std::FILE* out)
     for (std::uint32_t i = 0; i < count; ++i)
     {
         std::vector<unsigned char> file = MakeDeep();
-        // A third damaged: bits turned over, the end cut off, a byte made up, a number made
+        // A third damaged: bits turned over, the end cut off, a byte randomised, a number made
         // up (one such as a damaged header has, or a small one).
         if (Next() % 3 == 0)
         {
@@ -2111,9 +2111,9 @@ int main(int argc, char** argv)
                 }
                 sound = sound && (change == 1 || made.tiled || by == 0);
             }
-            // A third of them damaged: bits turned over, the end cut off, a byte made up or
-            // made zero, a number of the header made up, the table of offsets changed, a
-            // number at the start of a block made up, or one of those a PIZ block's data
+            // A third of them damaged: bits turned over, the end cut off, a byte randomised or
+            // made zero, a number of the header randomised, the table of offsets changed, a
+            // number at the start of a block randomised, or one of those a PIZ block's data
             // starts with.
             if (Next() % 3 == 0)
             {
@@ -2199,7 +2199,7 @@ int main(int argc, char** argv)
                 }
                 else if (how == 9)
                 {
-                    // (ZFP) one of its settings made up.
+                    // (ZFP) one of its settings randomised.
                     const std::uint32_t which = Next() % 4;
                     if (which == 0)
                     {
@@ -2223,8 +2223,8 @@ int main(int argc, char** argv)
                 else
                 {
                     // The table of offsets comes after the header: one of its first six
-                    // made zero, put near the end, made up, or changed for the one after
-                    // it; or a number at the start of the block it leads to made up.
+                    // made zero, put near the end, randomised, or changed for the one after
+                    // it; or a number at the start of the block it leads to randomised.
                     const std::size_t table = EndOfHeader(file);
                     const std::uint32_t entry = Next() % 6;
                     const std::uint32_t pick = Next();
@@ -2264,7 +2264,7 @@ int main(int argc, char** argv)
                                     // A PIZ block: after the numbers it starts with, the
                                     // least and the most of its values, a bitmap from the one
                                     // to the other, a length, and the five numbers the
-                                    // Huffman coder starts with: one of the six made up.
+                                    // Huffman coder starts with: one of the six randomised.
                                     std::size_t data = block + (made.tiled ? 20 : 8);
                                     if (data + 4 <= file.size())
                                     {

@@ -18,16 +18,14 @@
 //! with [`super::parts::PAST_THE_END`]. So is a file the original stops on (an attribute too
 //! short for what it reads of it, a size it cannot allocate).
 
+use crate::TileLevelMode;
 use std::borrow::Cow;
 use std::cell::Cell;
 
 use super::parts::PAST_THE_END;
 use super::zip_rle::{decompress_rle, decompress_zip, unpredict_and_reorder};
 use super::{
-    COMPRESSIONTYPE_B44, COMPRESSIONTYPE_B44A, COMPRESSIONTYPE_NONE, COMPRESSIONTYPE_PIZ,
-    COMPRESSIONTYPE_RLE, COMPRESSIONTYPE_ZIP, COMPRESSIONTYPE_ZIPS, ChannelInfo,
-    ERROR_INVALID_DATA, ERROR_INVALID_FILE, ERROR_INVALID_MAGIC_NUMBER, ERROR_UNSUPPORTED_FORMAT,
-    ExrError, PIXELTYPE_FLOAT, PIXELTYPE_HALF, PIXELTYPE_UINT, half_to_float, read_attribute,
+    ChannelInfo, Compression, ErrorCode, ExrError, PixelType, half_to_float, read_attribute,
     read_channel_info,
 };
 use miniz_nrp::{DecompressError, Format};
@@ -35,14 +33,18 @@ use miniz_nrp::{DecompressError, Format};
 /// `DeepImage`: the samples of a deep image, line by line.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeepImage {
+    /// The name of each channel.
     pub channel_names: Vec<String>,
     /// `image[channel][line]`: the samples of a line, every pixel's one after another. (Of a
     /// file of scanlines, the lines that have a block of their own: see the module's notes.)
     pub image: Vec<Vec<Vec<f32>>>,
     /// `offset_table[line][x]`: how many samples the line has up to and including pixel `x`.
     pub offset_table: Vec<Vec<i32>>,
+    /// How many channels it has.
     pub num_channels: i32,
+    /// Its width in pixels.
     pub width: i32,
+    /// Its height in pixels.
     pub height: i32,
 }
 
@@ -84,7 +86,7 @@ impl From<ExrError> for Stop {
     }
 }
 
-fn error(code: i32, message: &str) -> Stop {
+fn error(code: ErrorCode, message: &str) -> Stop {
     Stop::Error(ExrError {
         code,
         message: message.to_string(),
@@ -145,7 +147,7 @@ impl<'a> Memory<'a> {
 }
 
 /// `LoadDeepEXR`, of a file in memory: its deep image.
-pub fn load_deep_exr_from_memory(memory: &[u8]) -> Result<DeepImage, ExrError> {
+pub fn load_deep(memory: &[u8]) -> Result<DeepImage, ExrError> {
     let zeros = Memory {
         bytes: memory,
         pad: 0x00,
@@ -154,7 +156,7 @@ pub fn load_deep_exr_from_memory(memory: &[u8]) -> Result<DeepImage, ExrError> {
     let first = load(&zeros);
     if let Err(Stop::Outside) = first {
         return Err(ExrError {
-            code: ERROR_INVALID_DATA,
+            code: ErrorCode::INVALID_DATA,
             message: PAST_THE_END.to_string(),
         });
     }
@@ -174,7 +176,7 @@ pub fn load_deep_exr_from_memory(memory: &[u8]) -> Result<DeepImage, ExrError> {
         (Ok(a), Ok(b)) if same(&a, &b) => Ok(a),
         (Err(Stop::Error(a)), Err(Stop::Error(b))) if a == b => Err(a),
         _ => Err(ExrError {
-            code: ERROR_INVALID_DATA,
+            code: ErrorCode::INVALID_DATA,
             message: PAST_THE_END.to_string(),
         }),
     }
@@ -198,12 +200,15 @@ fn same(a: &DeepImage, b: &DeepImage) -> bool {
 fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     let file_size = memory.bytes.len();
     if file_size == 0 {
-        return Err(error(ERROR_INVALID_FILE, "File size is zero"));
+        return Err(error(ErrorCode::INVALID_FILE, "File size is zero"));
     }
 
     // Header check.
     if memory.read(0, 4)?[..] != [0x76, 0x2f, 0x31, 0x01] {
-        return Err(error(ERROR_INVALID_MAGIC_NUMBER, "Invalid magic number"));
+        return Err(error(
+            ErrorCode::INVALID_MAGIC_NUMBER,
+            "Invalid magic number",
+        ));
     }
     let mut marker = 4i64;
 
@@ -214,7 +219,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         let version = memory.read(marker, 4)?;
         if version[0] != 2 || version[1] != 8 || version[2] != 0 || version[3] != 0 {
             return Err(error(
-                ERROR_UNSUPPORTED_FORMAT,
+                ErrorCode::UNSUPPORTED_FORMAT,
                 "Unsupported version or scanline",
             ));
         }
@@ -226,7 +231,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     let mut dw = -1i32;
     let mut dh = -1i32;
     let mut num_scanline_blocks = 1i32; // 16 for ZIP compression.
-    let mut compression_type = -1i32;
+    let mut compression_type = Compression(-1);
     let mut num_channels = -1i32;
     let mut is_tiled = false; // deep *tiled* part (type == "deeptile")
     let mut tile_size_x = -1i32;
@@ -239,7 +244,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     let mut size = (file_size as u64).wrapping_sub(8);
     loop {
         if size == 0 {
-            return Err(error(ERROR_INVALID_DATA, ""));
+            return Err(error(ErrorCode::INVALID_DATA, ""));
         } else if memory.read(marker, 1)?[0] == 0 {
             marker += 1;
             break;
@@ -247,7 +252,10 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
 
         let block = memory.read(marker, size)?;
         let Some((attr_name, attr_type, data, marker_size)) = read_attribute(&block) else {
-            return Err(error(ERROR_INVALID_DATA, "Failed to parse attribute\n"));
+            return Err(error(
+                ErrorCode::INVALID_DATA,
+                "Failed to parse attribute\n",
+            ));
         };
         let _ = attr_type;
         marker += marker_size as i64;
@@ -266,18 +274,18 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         match attr_name.as_str() {
             "compression" => {
                 need(1)?;
-                compression_type = i32::from(data[0]);
-                if compression_type > COMPRESSIONTYPE_B44A {
+                compression_type = Compression(i32::from(data[0]));
+                if compression_type > Compression::B44A {
                     return Err(Stop::Error(ExrError {
-                        code: ERROR_UNSUPPORTED_FORMAT,
-                        message: format!("Unsupported compression type : {compression_type}"),
+                        code: ErrorCode::UNSUPPORTED_FORMAT,
+                        message: format!("Unsupported compression type : {}", compression_type.0),
                     }));
                 }
 
-                if compression_type == COMPRESSIONTYPE_ZIP {
+                if compression_type == Compression::ZIP {
                     num_scanline_blocks = 16;
-                } else if compression_type == COMPRESSIONTYPE_B44
-                    || compression_type == COMPRESSIONTYPE_B44A
+                } else if compression_type == Compression::B44
+                    || compression_type == Compression::B44A
                 {
                     num_scanline_blocks = 32;
                 }
@@ -290,13 +298,16 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                 // xSampling: int
                 // ySampling: int
                 if !read_channel_info(&mut channels, &data) {
-                    return Err(error(ERROR_INVALID_DATA, "Failed to parse channel info"));
+                    return Err(error(
+                        ErrorCode::INVALID_DATA,
+                        "Failed to parse channel info",
+                    ));
                 }
 
                 num_channels = channels.len() as i32;
 
                 if num_channels < 1 {
-                    return Err(error(ERROR_INVALID_DATA, "Invalid channels format"));
+                    return Err(error(ErrorCode::INVALID_DATA, "Invalid channels format"));
                 }
             }
             "dataWindow" => {
@@ -327,7 +338,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     }
 
     if dx < 0 || dy < 0 || dw < 0 || dh < 0 || num_channels < 1 {
-        return Err(error(ERROR_INVALID_DATA, ""));
+        return Err(error(ErrorCode::INVALID_DATA, ""));
     }
 
     let data_width = dw.wrapping_sub(dx).wrapping_add(1);
@@ -343,7 +354,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
             data_height,
             tile_size_x,
             tile_size_y,
-            tile_level_mode,
+            TileLevelMode(tile_level_mode),
             marker,
         );
     }
@@ -363,14 +374,14 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         marker += 8;
     }
 
-    if !(compression_type == COMPRESSIONTYPE_NONE
-        || compression_type == COMPRESSIONTYPE_RLE
-        || compression_type == COMPRESSIONTYPE_ZIPS
-        || compression_type == COMPRESSIONTYPE_ZIP
-        || compression_type == COMPRESSIONTYPE_PIZ)
+    if !(compression_type == Compression::NONE
+        || compression_type == Compression::RLE
+        || compression_type == Compression::ZIPS
+        || compression_type == Compression::ZIP
+        || compression_type == Compression::PIZ)
     {
         return Err(error(
-            ERROR_UNSUPPORTED_FORMAT,
+            ErrorCode::UNSUPPORTED_FORMAT,
             "Unsupported compression format",
         ));
     }
@@ -419,7 +430,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
             };
 
             if table.len() != width * 4 {
-                return Err(error(ERROR_INVALID_DATA, ""));
+                return Err(error(ErrorCode::INVALID_DATA, ""));
             }
             for (value, bytes) in pixel_offset_table
                 .iter_mut()
@@ -451,7 +462,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                 return Ok(unfinished());
             };
             if samples.len() as u64 != unpacked_sample_data_size as u64 {
-                return Err(error(ERROR_INVALID_DATA, ""));
+                return Err(error(ErrorCode::INVALID_DATA, ""));
             }
             sample_data = samples;
         }
@@ -460,21 +471,26 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         let mut channel_offset = 0i32;
         for channel in &channels {
             channel_offset += match channel.pixel_type {
-                PIXELTYPE_UINT => 4,
-                PIXELTYPE_HALF => 2,
-                PIXELTYPE_FLOAT => 4,
-                _ => return Err(error(ERROR_INVALID_DATA, "Invalid pixel_type in chnnels.")),
+                PixelType::UINT => 4,
+                PixelType::HALF => 2,
+                PixelType::FLOAT => 4,
+                _ => {
+                    return Err(error(
+                        ErrorCode::INVALID_DATA,
+                        "Invalid pixel_type in chnnels.",
+                    ));
+                }
             };
         }
         let sample_size = channel_offset;
         if sample_size < 2 {
-            return Err(error(ERROR_INVALID_DATA, ""));
+            return Err(error(ErrorCode::INVALID_DATA, ""));
         }
 
         if pixel_offset_table[width - 1].wrapping_mul(sample_size) as i64 as u64
             != sample_data.len() as u64
         {
-            return Err(error(ERROR_INVALID_DATA, ""));
+            return Err(error(ErrorCode::INVALID_DATA, ""));
         }
         let samples_per_line = (sample_data.len() as i32 / sample_size) as usize;
 
@@ -482,7 +498,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         let mut data_offset = 0usize;
         for (c, channel) in channels.iter().enumerate() {
             let line: Vec<f32> = match channel.pixel_type {
-                PIXELTYPE_UINT => (0..samples_per_line)
+                PixelType::UINT => (0..samples_per_line)
                     .map(|x| {
                         u32::from_le_bytes(
                             sample_data[data_offset + x * 4..data_offset + x * 4 + 4]
@@ -491,7 +507,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                         ) as f32
                     })
                     .collect(), // @fixme
-                PIXELTYPE_HALF => (0..samples_per_line)
+                PixelType::HALF => (0..samples_per_line)
                     .map(|x| {
                         half_to_float(u16::from_le_bytes(
                             sample_data[data_offset + x * 2..data_offset + x * 2 + 2]
@@ -511,7 +527,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                     .collect(),
             };
             data_offset += samples_per_line
-                * if channel.pixel_type == PIXELTYPE_HALF {
+                * if channel.pixel_type == PixelType::HALF {
                     2
                 } else {
                     4
@@ -583,11 +599,11 @@ fn decompress_zip_from(
 }
 
 /// `DecompressDeep`
-fn decompress_deep(compression_type: i32, dst: &mut [u8], src: &[u8]) -> bool {
+fn decompress_deep(compression_type: Compression, dst: &mut [u8], src: &[u8]) -> bool {
     if dst.is_empty() {
         return true;
     }
-    if compression_type == COMPRESSIONTYPE_RLE {
+    if compression_type == Compression::RLE {
         return decompress_rle(dst, dst.len(), src);
     }
     let mut ul = dst.len();
@@ -605,40 +621,40 @@ fn decode_deep_tiled(
     memory: &Memory,
     channels: &[ChannelInfo],
     num_channels: i32,
-    compression_type: i32,
+    compression_type: Compression,
     data_width: i32,
     data_height: i32,
     tile_size_x: i32,
     tile_size_y: i32,
-    tile_level_mode: i32,
+    tile_level_mode: TileLevelMode,
     mut marker: i64,
 ) -> Result<DeepImage, Stop> {
     let file_size = memory.bytes.len() as u64;
     if tile_size_x <= 0 || tile_size_y <= 0 {
         return Err(error(
-            ERROR_INVALID_DATA,
+            ErrorCode::INVALID_DATA,
             "Invalid tile size in deep tiled image",
         ));
     }
-    if tile_level_mode != 0 {
+    if tile_level_mode != TileLevelMode(0) {
         return Err(error(
-            ERROR_UNSUPPORTED_FORMAT,
+            ErrorCode::UNSUPPORTED_FORMAT,
             "Only single-level (ONE_LEVEL) deep tiled images are supported",
         ));
     }
     if data_width <= 0 || data_height <= 0 || num_channels < 1 {
         return Err(error(
-            ERROR_INVALID_DATA,
+            ErrorCode::INVALID_DATA,
             "Invalid deep tiled image dimensions",
         ));
     }
-    if !(compression_type == COMPRESSIONTYPE_NONE
-        || compression_type == COMPRESSIONTYPE_RLE
-        || compression_type == COMPRESSIONTYPE_ZIPS
-        || compression_type == COMPRESSIONTYPE_ZIP)
+    if !(compression_type == Compression::NONE
+        || compression_type == Compression::RLE
+        || compression_type == Compression::ZIPS
+        || compression_type == Compression::ZIP)
     {
         return Err(error(
-            ERROR_UNSUPPORTED_FORMAT,
+            ErrorCode::UNSUPPORTED_FORMAT,
             "Unsupported compression for deep tiled image",
         ));
     }
@@ -647,11 +663,11 @@ fn decode_deep_tiled(
     let mut sample_size = 0i32;
     for channel in channels {
         let ps = match channel.pixel_type {
-            PIXELTYPE_HALF => 2,
-            PIXELTYPE_UINT | PIXELTYPE_FLOAT => 4,
+            PixelType::HALF => 2,
+            PixelType::UINT | PixelType::FLOAT => 4,
             _ => {
                 return Err(error(
-                    ERROR_INVALID_DATA,
+                    ErrorCode::INVALID_DATA,
                     "Invalid pixel type in deep tiled image",
                 ));
             }
@@ -666,7 +682,10 @@ fn decode_deep_tiled(
     let (num_x_tiles, num_y_tiles) = (num_x_tiles as i32, num_y_tiles as i32);
 
     if marker as u64 + num_tiles.saturating_mul(8) > file_size {
-        return Err(error(ERROR_INVALID_DATA, "Corrupt deep tiled offset table"));
+        return Err(error(
+            ErrorCode::INVALID_DATA,
+            "Corrupt deep tiled offset table",
+        ));
     }
     let mut tile_offsets = Vec::with_capacity(num_tiles as usize);
     for _ in 0..num_tiles {
@@ -718,21 +737,24 @@ fn decode_deep_tiled(
     let mut tiles = Vec::with_capacity(tile_offsets.len());
     for &offset in &tile_offsets {
         if offset.checked_add(40).is_none_or(|end| end > file_size) {
-            return Err(error(ERROR_INVALID_DATA, "Corrupt deep tile chunk"));
+            return Err(error(ErrorCode::INVALID_DATA, "Corrupt deep tile chunk"));
         }
         let (tile_x, tile_y, level_x, level_y, pots, psds, usds) = tile_at(offset)?;
         if level_x != 0 || level_y != 0 {
             return Err(error(
-                ERROR_UNSUPPORTED_FORMAT,
+                ErrorCode::UNSUPPORTED_FORMAT,
                 "Unsupported deep tile level",
             ));
         }
         if tile_x < 0 || tile_y < 0 || tile_x >= num_x_tiles || tile_y >= num_y_tiles || pots < 0 {
-            return Err(error(ERROR_INVALID_DATA, "Corrupt deep tile header"));
+            return Err(error(ErrorCode::INVALID_DATA, "Corrupt deep tile header"));
         }
         let otab_packed = offset + 40;
         if otab_packed + pots as u64 > file_size {
-            return Err(error(ERROR_INVALID_DATA, "Corrupt deep tile offset table"));
+            return Err(error(
+                ErrorCode::INVALID_DATA,
+                "Corrupt deep tile offset table",
+            ));
         }
         let (x0, y0, tw, th) = place(tile_x, tile_y);
         let need = tw * th;
@@ -740,7 +762,7 @@ fn decode_deep_tiled(
         let src = memory.read(otab_packed as i64, pots as u64)?;
         if !decompress_deep(compression_type, &mut otab, &src) {
             return Err(error(
-                ERROR_INVALID_DATA,
+                ErrorCode::INVALID_DATA,
                 "Failed to decompress deep tile offset table",
             ));
         }
@@ -753,7 +775,7 @@ fn decode_deep_tiled(
                 let cnt = cum.wrapping_sub(prev);
                 if cnt < 0 {
                     return Err(error(
-                        ERROR_INVALID_DATA,
+                        ErrorCode::INVALID_DATA,
                         "Corrupt deep tile (negative sample count)",
                     ));
                 }
@@ -804,11 +826,17 @@ fn decode_deep_tiled(
             usds,
         } = *tile;
         if psds < 0 || usds < 0 {
-            return Err(error(ERROR_INVALID_DATA, "Corrupt deep tile sample sizes"));
+            return Err(error(
+                ErrorCode::INVALID_DATA,
+                "Corrupt deep tile sample sizes",
+            ));
         }
         let samp_packed = offset + 40 + pots as u64;
         if samp_packed + psds as u64 > file_size {
-            return Err(error(ERROR_INVALID_DATA, "Corrupt deep tile sample data"));
+            return Err(error(
+                ErrorCode::INVALID_DATA,
+                "Corrupt deep tile sample data",
+            ));
         }
 
         let mut tile_total = 0u64;
@@ -819,21 +847,24 @@ fn decode_deep_tiled(
             }
         }
         if usds != (tile_total as i64).wrapping_mul(sample_size as i64) {
-            return Err(error(ERROR_INVALID_DATA, "Deep tile sample size mismatch"));
+            return Err(error(
+                ErrorCode::INVALID_DATA,
+                "Deep tile sample size mismatch",
+            ));
         }
         let src = memory.read(samp_packed as i64, psds as u64)?;
         let usds = usds as u64;
         // (A block that says more than its bytes can come to does not come out that long.)
         if usds != src.len() as u64 && usds > most_from(src.len()) {
             return Err(error(
-                ERROR_INVALID_DATA,
+                ErrorCode::INVALID_DATA,
                 "Failed to decompress deep tile sample data",
             ));
         }
         let mut sbuf = vec![0u8; usds as usize];
         if !decompress_deep(compression_type, &mut sbuf, &src) {
             return Err(error(
-                ERROR_INVALID_DATA,
+                ErrorCode::INVALID_DATA,
                 "Failed to decompress deep tile sample data",
             ));
         }
@@ -865,10 +896,10 @@ fn decode_deep_tiled(
                     for (s, value) in dst.iter_mut().enumerate() {
                         let at = sp + s * ps;
                         *value = match channel.pixel_type {
-                            PIXELTYPE_UINT => {
+                            PixelType::UINT => {
                                 u32::from_le_bytes(sbuf[at..at + 4].try_into().unwrap()) as f32
                             }
-                            PIXELTYPE_HALF => half_to_float(u16::from_le_bytes(
+                            PixelType::HALF => half_to_float(u16::from_le_bytes(
                                 sbuf[at..at + 2].try_into().unwrap(),
                             )),
                             _ => f32::from_le_bytes(sbuf[at..at + 4].try_into().unwrap()),
@@ -918,7 +949,7 @@ mod tests {
             &mut file,
             "compression",
             "compression",
-            &[COMPRESSIONTYPE_ZIPS as u8],
+            &[Compression::ZIPS.0 as u8],
         );
         let window: Vec<u8> = [0i32, 0, 1, 1]
             .iter()
@@ -976,7 +1007,7 @@ mod tests {
 
     #[test]
     fn a_deep_file_of_scanlines_is_read() {
-        let image = load_deep_exr_from_memory(&deep_file()).unwrap();
+        let image = load_deep(&deep_file()).unwrap();
         assert_eq!(
             (
                 image.width,
@@ -997,8 +1028,8 @@ mod tests {
             // (Refused, or, where a compressed block is cut, handed back unfinished, as the
             // original does: with no width.)
             assert!(
-                load_deep_exr_from_memory(&file[..len]).is_ok_and(|image| image.width == 0)
-                    || load_deep_exr_from_memory(&file[..len]).is_err(),
+                load_deep(&file[..len]).is_ok_and(|image| image.width == 0)
+                    || load_deep(&file[..len]).is_err(),
                 "{len}"
             );
         }

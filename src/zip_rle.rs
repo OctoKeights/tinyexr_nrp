@@ -15,7 +15,7 @@ fn reorder_and_predict(src: &[u8]) -> Vec<u8> {
     // Reorder the pixel data.
     {
         let mut t1 = 0usize;
-        let mut t2 = (src_size + 1) / 2;
+        let mut t2 = src_size.div_ceil(2);
         let mut s = 0usize;
         loop {
             if s < src_size {
@@ -60,7 +60,7 @@ pub(crate) fn unpredict_and_reorder(dst: &mut [u8], tmp_buf: &mut [u8]) {
     // Reorder the pixel data.
     {
         let mut t1 = 0usize;
-        let mut t2 = (size + 1) / 2;
+        let mut t2 = size.div_ceil(2);
         let mut s = 0usize;
         loop {
             if s < size {

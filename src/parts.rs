@@ -1,6 +1,6 @@
 //! Files of many parts: a port of `ParseEXRMultipartHeaderFromMemory` and
 //! `LoadEXRMultipartImageFromMemory` of tinyexr v3.4.0 (`tinyexr.h`). (The writer is
-//! [`super::save_exr_multipart_image_to_memory`].)
+//! [`super::save_multipart_images`].)
 //!
 //! Both read past the end of a damaged file: the first parses every header as if the whole
 //! of the file after the first one were left, the second reads its table of offsets, and the
@@ -12,26 +12,26 @@
 
 use super::chunk::{OffsetData, decode_chunk, precalculate_tile_info, tile_offsets_shape};
 use super::{
-    ERROR_INVALID_ARGUMENT, ERROR_INVALID_DATA, ERROR_INVALID_HEADER, ExrError, ExrHeader,
-    ExrImage, ExrVersion, HeaderInfo, TILE_ONE_LEVEL, convert_header, parse_exr_header,
+    ErrorCode, ExrError, ExrHeader, ExrImage, ExrVersion, HeaderInfo, TileLevelMode,
+    convert_header, parse_exr_header,
 };
 
 const EXR_VERSION_SIZE: usize = 8;
 
 /// The message of a file refused because the original's answer for it depends on memory past
-/// its end, or because the original stops on it. (Its code is `ERROR_INVALID_DATA`.)
+/// its end, or because the original stops on it. (Its code is `ErrorCode`.)
 pub const PAST_THE_END: &str =
     "The file is damaged: tinyexr reads past its end for it, or stops on it.";
 
 fn past_the_end() -> ExrError {
     ExrError {
-        code: ERROR_INVALID_DATA,
+        code: ErrorCode::INVALID_DATA,
         message: PAST_THE_END.to_string(),
     }
 }
 
 /// `ParseEXRMultipartHeaderFromMemory`: the header of every part of a file of many parts.
-pub fn parse_exr_multipart_header_from_memory(
+pub fn parse_multipart_headers(
     version: &ExrVersion,
     memory: &[u8],
 ) -> Result<Vec<ExrHeader>, ExrError> {
@@ -39,7 +39,7 @@ pub fn parse_exr_multipart_header_from_memory(
 }
 
 /// `ParseEXRMultipartHeaderFromMemory` exactly as tinyexr has it, which refuses DWAA and DWAB.
-pub fn parse_exr_multipart_header_from_memory_as_tinyexr(
+pub fn parse_multipart_headers_as_tinyexr(
     version: &ExrVersion,
     memory: &[u8],
 ) -> Result<Vec<ExrHeader>, ExrError> {
@@ -53,7 +53,7 @@ fn parse_multipart_header(
 ) -> Result<Vec<ExrHeader>, ExrError> {
     if memory.len() < EXR_VERSION_SIZE {
         return Err(ExrError {
-            code: ERROR_INVALID_DATA,
+            code: ErrorCode::INVALID_DATA,
             message: "Data size too short".to_string(),
         });
     }
@@ -152,7 +152,7 @@ fn parse_headers(
         if info.chunk_count == 0 {
             return (
                 Err(ExrError {
-                    code: ERROR_INVALID_DATA,
+                    code: ErrorCode::INVALID_DATA,
                     message: "`chunkCount' attribute is not found in the header.".to_string(),
                 }),
                 beyond,
@@ -165,7 +165,7 @@ fn parse_headers(
     }
 
     let mut headers = Vec::with_capacity(infos.len());
-    let mut retcode = 0;
+    let mut retcode = ErrorCode::SUCCESS;
     let mut message = String::new();
     for info in &infos {
         let mut warn = String::new();
@@ -177,7 +177,7 @@ fn parse_headers(
                     message = err;
                 }
                 // continue to converting headers
-                retcode = ERROR_INVALID_HEADER;
+                retcode = ErrorCode::INVALID_HEADER;
                 ExrHeader::default()
             }
         };
@@ -185,7 +185,7 @@ fn parse_headers(
         headers.push(exr_header);
     }
 
-    if retcode != 0 {
+    if retcode != ErrorCode::SUCCESS {
         return (
             Err(ExrError {
                 code: retcode,
@@ -223,9 +223,9 @@ fn read_le<const N: usize>(memory: &[u8], at: usize) -> (u64, bool) {
 }
 
 /// `LoadEXRMultipartImageFromMemory`: the pixels of every part of the file, whose headers
-/// [`parse_exr_multipart_header_from_memory`] gave. Each part's channels come as its
-/// header's `requested_pixel_types` ask, as [`super::load_exr_image_from_memory`] gives them.
-pub fn load_exr_multipart_image_from_memory(
+/// [`parse_multipart_headers`] gave. Each part's channels come as its
+/// header's `requested_pixel_types` ask, as [`super::load_image`] gives them.
+pub fn load_multipart_images(
     exr_headers: &mut [ExrHeader],
     memory: &[u8],
 ) -> Result<Vec<ExrImage>, ExrError> {
@@ -233,8 +233,8 @@ pub fn load_exr_multipart_image_from_memory(
 }
 
 /// `LoadEXRMultipartImageFromMemory` exactly as tinyexr has it
-/// ([`super::load_exr_image_from_memory_as_tinyexr`] says where that differs).
-pub fn load_exr_multipart_image_from_memory_as_tinyexr(
+/// ([`super::load_image_as_tinyexr`] says where that differs).
+pub fn load_multipart_images_as_tinyexr(
     exr_headers: &mut [ExrHeader],
     memory: &[u8],
 ) -> Result<Vec<ExrImage>, ExrError> {
@@ -275,13 +275,13 @@ fn load_parts_with_zeros(
     let num_parts = exr_headers.len();
     if num_parts == 0 || size <= EXR_VERSION_SIZE {
         return Err(ExrError {
-            code: ERROR_INVALID_ARGUMENT,
+            code: ErrorCode::INVALID_ARGUMENT,
             message: "Invalid argument for LoadEXRMultipartImageFromMemory()".to_string(),
         });
     }
     fn fail<T>(message: &str) -> Result<T, ExrError> {
         Err(ExrError {
-            code: ERROR_INVALID_DATA,
+            code: ErrorCode::INVALID_DATA,
             message: message.to_string(),
         })
     }
@@ -291,7 +291,7 @@ fn load_parts_with_zeros(
     for exr_header in exr_headers.iter() {
         if exr_header.header_len == 0 {
             return Err(ExrError {
-                code: ERROR_INVALID_ARGUMENT,
+                code: ErrorCode::INVALID_ARGUMENT,
                 message: "EXRHeader variable is not initialized.".to_string(),
             });
         }
@@ -330,7 +330,7 @@ fn load_parts_with_zeros(
     let mut chunk_offset_table_list: Vec<OffsetData> = Vec::with_capacity(num_parts);
     for exr_header in exr_headers.iter() {
         let mut offset_data = OffsetData::default();
-        if exr_header.tiled == 0 || exr_header.tile_level_mode == TILE_ONE_LEVEL {
+        if exr_header.tiled == 0 || exr_header.tile_level_mode == TileLevelMode::ONE_LEVEL {
             // `InitSingleResolutionOffsets`. (A count below zero is one the original cannot
             // make a table of, which stops it.)
             if exr_header.chunk_count < 0 {
@@ -381,7 +381,7 @@ fn load_parts_with_zeros(
                 // (With ones past the end, the number is never `i`.)
                 *divergence = Some(Divergence {
                     error: ExrError {
-                        code: ERROR_INVALID_DATA,
+                        code: ErrorCode::INVALID_DATA,
                         message: "Invalid `part number' in EXR header chunks.".to_string(),
                     },
                 });
@@ -398,7 +398,7 @@ fn load_parts_with_zeros(
             &mut e,
             as_tinyexr,
         );
-        if ret != 0 {
+        if ret != ErrorCode::SUCCESS {
             return Err(ExrError {
                 code: ret,
                 message: e,
@@ -413,10 +413,8 @@ fn load_parts_with_zeros(
 #[cfg(test)]
 mod tests {
     use super::super::{
-        COMPRESSIONTYPE_ZIP, ChannelData, ChannelInfo, ExrHeader, ExrImage, PIXELTYPE_FLOAT,
-        PIXELTYPE_HALF, load_exr_multipart_image_from_memory,
-        parse_exr_multipart_header_from_memory, parse_exr_version_from_memory,
-        save_exr_multipart_image_to_memory,
+        ChannelData, ChannelInfo, Compression, ExrHeader, ExrImage, PixelType,
+        load_multipart_images, parse_multipart_headers, parse_version, save_multipart_images,
     };
 
     fn part(name: &str, width: i32, height: i32, value: f32) -> (ExrImage, ExrHeader) {
@@ -430,14 +428,14 @@ mod tests {
         let header = ExrHeader {
             channels: vec![ChannelInfo {
                 name: "Y".to_string(),
-                pixel_type: PIXELTYPE_HALF,
+                pixel_type: PixelType::HALF,
                 x_sampling: 1,
                 y_sampling: 1,
                 p_linear: 0,
             }],
-            pixel_types: vec![PIXELTYPE_FLOAT],
-            requested_pixel_types: vec![PIXELTYPE_HALF],
-            compression_type: COMPRESSIONTYPE_ZIP,
+            pixel_types: vec![PixelType::FLOAT],
+            requested_pixel_types: vec![PixelType::HALF],
+            compression_type: Compression::ZIP,
             name: name.to_string(),
             ..ExrHeader::default()
         };
@@ -448,10 +446,10 @@ mod tests {
     fn parts_are_written_and_read_back() {
         let (a, a_header) = part("left", 20, 17, 0.5);
         let (b, b_header) = part("right", 3, 40, 2.0);
-        let file = save_exr_multipart_image_to_memory(&[(&a, &a_header), (&b, &b_header)]).unwrap();
-        let version = parse_exr_version_from_memory(&file).unwrap();
+        let file = save_multipart_images(&[(&a, &a_header), (&b, &b_header)]).unwrap();
+        let version = parse_version(&file).unwrap();
         assert!(version.multipart);
-        let mut headers = parse_exr_multipart_header_from_memory(&version, &file).unwrap();
+        let mut headers = parse_multipart_headers(&version, &file).unwrap();
         assert_eq!(
             headers
                 .iter()
@@ -459,7 +457,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["left", "right"]
         );
-        let images = load_exr_multipart_image_from_memory(&mut headers, &file).unwrap();
+        let images = load_multipart_images(&mut headers, &file).unwrap();
         assert_eq!(
             (
                 images[0].width,
@@ -476,16 +474,14 @@ mod tests {
     fn parts_need_names_of_their_own() {
         let (a, a_header) = part("same", 2, 2, 1.0);
         let (b, b_header) = part("same", 2, 2, 1.0);
-        let error =
-            save_exr_multipart_image_to_memory(&[(&a, &a_header), (&b, &b_header)]).unwrap_err();
+        let error = save_multipart_images(&[(&a, &a_header), (&b, &b_header)]).unwrap_err();
         assert_eq!(
             error.message,
             "'name' attributes must be unique for a multi-part file"
         );
         let (c, mut c_header) = part("", 2, 2, 1.0);
         c_header.name.clear();
-        let error =
-            save_exr_multipart_image_to_memory(&[(&a, &a_header), (&c, &c_header)]).unwrap_err();
+        let error = save_multipart_images(&[(&a, &a_header), (&c, &c_header)]).unwrap_err();
         assert_eq!(
             error.message,
             "Invalid 'name' attribute for a multi-part file"
@@ -496,9 +492,9 @@ mod tests {
     fn a_file_cut_short_is_refused_where_the_original_reads_past_its_end() {
         let (a, a_header) = part("left", 20, 17, 0.5);
         let (b, b_header) = part("right", 3, 40, 2.0);
-        let file = save_exr_multipart_image_to_memory(&[(&a, &a_header), (&b, &b_header)]).unwrap();
-        let version = parse_exr_version_from_memory(&file).unwrap();
-        let mut headers = parse_exr_multipart_header_from_memory(&version, &file).unwrap();
+        let file = save_multipart_images(&[(&a, &a_header), (&b, &b_header)]).unwrap();
+        let version = parse_version(&file).unwrap();
+        let mut headers = parse_multipart_headers(&version, &file).unwrap();
         // Cut in the table of offsets: the original reads the rest of it past the end.
         let end_of_headers = 8
             + headers
@@ -507,6 +503,6 @@ mod tests {
                 .sum::<usize>()
             + 1;
         let cut = &file[..end_of_headers + 12];
-        assert!(load_exr_multipart_image_from_memory(&mut headers, cut).is_err());
+        assert!(load_multipart_images(&mut headers, cut).is_err());
     }
 }

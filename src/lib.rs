@@ -1,73 +1,40 @@
-//! `.exr` files (OpenEXR), read and written: a native Rust port of Syoyo Fujita's
-//! [tinyexr](https://github.com/syoyo/tinyexr), v3.4.0 (`tinyexr.h`), as built without
-//! threads and with miniz for its ZIP compression ([`miniz_nrp`]).
+//! `.exr` files (OpenEXR) read and written in pure, safe Rust: a native port of Syoyo Fujita's
+//! [tinyexr](https://github.com/syoyo/tinyexr) v3.4.0, which writes the files tinyexr writes,
+//! byte for byte, reads the values it reads, and refuses the files it refuses, with the same
+//! code and message ([`ExrError`]).
 //!
-//! A file of one part, of scanlines or of tiles (with mip or rip levels), whose pixels are
-//! uncompressed or compressed with RLE, ZIPS, ZIP, PIZ, PXR24, B44 or B44A, or with DWAA or
-//! DWAB, which tinyexr does not have. Its channels are halves, floats or 32-bit integers.
+//! - [`load_rgba`] reads a file as red, green, blue and alpha floats, and [`save_floats`]
+//!   writes floats of one, three or four channels: what most callers want.
 //!
-//! - [`load_exr_from_memory`] gives red, green, blue and alpha as floats, and
-//!   [`save_exr_to_memory`] writes floats of one, three or four to a pixel: what most
-//!   callers want.
-//! - [`parse_exr_version_from_memory`], [`parse_exr_header_from_memory`] and
-//!   [`load_exr_image_from_memory`] give the header and then every channel as it is stored
-//!   (or the halves as floats), or every tile of every level;
-//!   [`save_exr_image_to_memory`] writes an image the same way, with [`tile_levels`] for
-//!   the levels a tiled one has.
+//! - [`parse_version`], [`parse_header`] and [`load_image`] give the header and then every
+//!   channel as it is stored, or every tile of every level; [`save_image`] writes an image
+//!   the same way, with [`tile_levels`] for the levels a tiled one has.
 //!
-//! The port writes the files the original writes, byte for byte, gives the values it gives,
-//! and refuses the files it refuses with the same code and message ([`ExrError`]), with
-//! these exceptions:
+//! - [`parse_multipart_headers`], [`load_multipart_images`] and [`save_multipart_images`] do
+//!   the same for files of several parts, and [`load_deep`] reads deep images.
 //!
-//! - **Blocks that do not come out smaller.** The format has a block stored as its pixels
-//!   when compressing it does not make it smaller, and a reader take a block as long as its
-//!   pixels for them. tinyexr does both for RLE, ZIP and PIZ and neither for PXR24, B44 and
-//!   B44A, so that other readers misread some of its files (every B44 file without a channel
-//!   of halves, and blocks of a few pixels), it misreads some of theirs, and now and then one
-//!   of its own PXR24 blocks. Here the format is followed; the functions that end in
-//!   `_as_tinyexr` do exactly as tinyexr does.
-//! - **Damaged files that stop the original**, or have it read past the end of the file, are
-//!   refused: a tile size of 0, a count of chunks larger than the file can hold a table for,
-//!   a compressed tile whose place is past the image's edge, and a block that is not
-//!   compressed and is shorter than its lines.
-//! - **What the writer is handed** is looked at where the original trusts it: a channel with
-//!   too few values, or a type that is not the values' type, is refused.
-//! - A small PIZ block of many different values, which the original writes past its buffer
-//!   for, is written as the original would write it with room enough.
-//! - **DWAA and DWAB**, which tinyexr refuses ("Unknown compression type."), are read and
-//!   written as OpenEXR 3.5 reads and writes them on an x86-64 machine with AVX
-//!   ([`openexr_nrp::dwa`]),
-//!   at the level of loss of the header's `dwaCompressionLevel`
-//!   ([`dwa_compression_level_attribute`]; 45 without it). The functions that end in
-//!   `_as_tinyexr`, [`parse_exr_header_from_memory_as_tinyexr`] and
-//!   [`parse_exr_multipart_header_from_memory_as_tinyexr`] among them, refuse them as tinyexr
-//!   does.
+//! Every compression tinyexr has is supported: RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A, and
+//! ZFP for floats ([`ZfpSettings`]). DWAA and DWAB, which tinyexr refuses, are read and written
+//! as OpenEXR 3.5 does ([`openexr_nrp::dwa`], at the level of
+//! [`dwa_compression_level_attribute`]).
 //!
-//! Files of several parts are read and written
-//! ([`parse_exr_multipart_header_from_memory`], [`load_exr_multipart_image_from_memory`],
-//! [`save_exr_multipart_image_to_memory`]), and deep images read
-//! ([`load_deep_exr_from_memory`]; tinyexr does not write them). Their readers in the original
-//! read past the end of a damaged file without a look. The port makes those reads with zeros
-//! and then with ones past the end: where the answer is the same, it is the original's answer
-//! whatever its memory holds, and it is given; where it is not, or the original would stop,
-//! the file is refused with [`PAST_THE_END`].
+//! Where tinyexr departs from the format, the functions ending in `_as_tinyexr` follow it
+//! exactly; the others follow the format. Damaged files that would have tinyexr read past
+//! their end, or stop, are refused. The
+//! [Guide](https://github.com/OctoKeights/tinyexr_nrp/blob/main/docs/guide.md) has the details.
 //!
-//! The ZFP compression tinyexr adds to the format is read and written, as tinyexr does with
-//! `TINYEXR_USE_ZFP`, with the port of what it uses of the zfp library v1.0.1 ([`zfp_nrp`]): for
-//! floats only, with the settings in attributes of the header ([`ZfpSettings`] makes them). What
-//! tinyexr cannot write with it is refused with a message of the port's own: a block or a tile that
-//! is not of whole blocks of four by four ([`ZFP_NOT_MULTIPLE_OF_FOUR`]; tinyexr writes a length it
-//! never set), and settings that ask for more than a gigabyte for a block ([`ZFP_TOO_LARGE`]).
+//! ```
+//! use tinyexr_nrp::{load_rgba, save_floats};
+//!
+//! let rgba = vec![0.5f32; 16 * 16 * 4];
+//! let file = save_floats(&rgba, 16, 16, 4, true).unwrap();
+//! let image = load_rgba(&file).unwrap();
+//! assert_eq!((image.width, image.height), (16, 16));
+//! assert_eq!(image.data, rgba);
+//! ```
 
 #![forbid(unsafe_code)]
-// The code follows the original's line for line, and these are its shapes.
-#![allow(
-    clippy::needless_range_loop,
-    clippy::too_many_arguments,
-    clippy::manual_range_contains
-)]
-// (The arithmetic is written as the original has it.)
-#![allow(clippy::if_same_then_else, clippy::manual_div_ceil)]
+#![warn(missing_docs)]
 
 mod b44;
 mod chunk;
@@ -81,75 +48,170 @@ mod zfp;
 mod zip_rle;
 
 pub use chunk::{TileLevel, tile_levels};
-pub use deep::{DeepImage, load_deep_exr_from_memory};
+pub use deep::{DeepImage, load_deep};
 pub use encode::{
     DWA_INVALID_LEVEL, ZFP_NOT_MULTIPLE_OF_FOUR, ZFP_TOO_LARGE, dwa_compression_level_attribute,
-    save_exr_image_to_memory, save_exr_image_to_memory_as_tinyexr,
-    save_exr_multipart_image_to_memory, save_exr_multipart_image_to_memory_as_tinyexr,
-    save_exr_to_memory,
+    save_floats, save_image, save_image_as_tinyexr, save_multipart_images,
+    save_multipart_images_as_tinyexr,
 };
 pub use parts::{
-    PAST_THE_END, load_exr_multipart_image_from_memory,
-    load_exr_multipart_image_from_memory_as_tinyexr, parse_exr_multipart_header_from_memory,
-    parse_exr_multipart_header_from_memory_as_tinyexr,
+    PAST_THE_END, load_multipart_images, load_multipart_images_as_tinyexr, parse_multipart_headers,
+    parse_multipart_headers_as_tinyexr,
 };
-pub use zfp::{
-    ZFP_COMPRESSIONTYPE_ACCURACY, ZFP_COMPRESSIONTYPE_PRECISION, ZFP_COMPRESSIONTYPE_RATE,
-    ZfpSettings,
-};
-
-/// The original's error codes (`TINYEXR_ERROR_*`).
-pub const ERROR_INVALID_MAGIC_NUMBER: i32 = -1;
-pub const ERROR_INVALID_EXR_VERSION: i32 = -2;
-pub const ERROR_INVALID_ARGUMENT: i32 = -3;
-pub const ERROR_INVALID_DATA: i32 = -4;
-pub const ERROR_INVALID_FILE: i32 = -5;
-pub const ERROR_INVALID_PARAMETER: i32 = -6;
-pub const ERROR_UNSUPPORTED_FORMAT: i32 = -8;
-pub const ERROR_INVALID_HEADER: i32 = -9;
-pub const ERROR_UNSUPPORTED_FEATURE: i32 = -10;
-pub const ERROR_SERIALIZATION_FAILED: i32 = -12;
-pub const ERROR_LAYER_NOT_FOUND: i32 = -13;
-pub const ERROR_DATA_TOO_LARGE: i32 = -14;
-
-/// The types of a channel's values (`TINYEXR_PIXELTYPE_*`).
-pub const PIXELTYPE_UINT: i32 = 0;
-pub const PIXELTYPE_HALF: i32 = 1;
-pub const PIXELTYPE_FLOAT: i32 = 2;
+pub use zfp::ZfpSettings;
 
 const MAX_HEADER_ATTRIBUTES: usize = 1024;
 const MAX_CUSTOM_ATTRIBUTES: usize = 128;
 
-/// How the pixels of a file are compressed (`TINYEXR_COMPRESSIONTYPE_*`).
-pub const COMPRESSIONTYPE_NONE: i32 = 0;
-pub const COMPRESSIONTYPE_RLE: i32 = 1;
-pub const COMPRESSIONTYPE_ZIPS: i32 = 2;
-pub const COMPRESSIONTYPE_ZIP: i32 = 3;
-pub const COMPRESSIONTYPE_PIZ: i32 = 4;
-pub const COMPRESSIONTYPE_PXR24: i32 = 5;
-pub const COMPRESSIONTYPE_B44: i32 = 6;
-pub const COMPRESSIONTYPE_B44A: i32 = 7;
-/// DreamWorks Animation's lossy compressions, of 32 lines and of 256 lines to a block (which
-/// tinyexr does not have: the functions that end in `_as_tinyexr` refuse them as it does).
-/// The `dwaCompressionLevel` attribute of a header, which
-/// [`dwa_compression_level_attribute`] makes, says how lossy (45 if a header has none).
-pub const COMPRESSIONTYPE_DWAA: i32 = 8;
-pub const COMPRESSIONTYPE_DWAB: i32 = 9;
-/// A tinyexr extension, of floats only, with the zfp library's coder; its settings are in
-/// attributes of the header, which [`ZfpSettings`] makes.
-pub const COMPRESSIONTYPE_ZFP: i32 = 128;
+/// Defines a code a file or tinyexr numbers something by: a newtype of the number, which
+/// keeps any value a file holds, with constants for those that have a meaning.
+macro_rules! code {
+    ($(#[$doc:meta])* $name:ident { $($(#[$cdoc:meta])* $constant:ident = $value:expr),* $(,)? }) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub i32);
 
-/// The levels of a tiled file (`TINYEXR_TILE_*`).
-pub const TILE_ONE_LEVEL: i32 = 0;
-pub const TILE_MIPMAP_LEVELS: i32 = 1;
-pub const TILE_RIPMAP_LEVELS: i32 = 2;
-pub const TILE_ROUND_DOWN: i32 = 0;
-pub const TILE_ROUND_UP: i32 = 1;
+        impl $name {
+            $($(#[$cdoc])* pub const $constant: $name = $name($value);)*
+
+            /// The name of the constant with this value, if there is one.
+            pub const fn name(self) -> Option<&'static str> {
+                match self.0 {
+                    $($value => Some(stringify!($constant)),)*
+                    _ => None,
+                }
+            }
+        }
+
+        impl From<i32> for $name {
+            fn from(value: i32) -> Self {
+                $name(value)
+            }
+        }
+
+        impl From<$name> for i32 {
+            fn from(code: $name) -> i32 {
+                code.0
+            }
+        }
+
+        impl core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                match self.name() {
+                    Some(name) => write!(f, "{}::{}", stringify!($name), name),
+                    None => write!(f, "{}({})", stringify!($name), self.0),
+                }
+            }
+        }
+    };
+}
+
+code! {
+    /// One of the original's error codes (`TINYEXR_ERROR_*`).
+    ErrorCode {
+        /// No error (`TINYEXR_SUCCESS`), which the original's functions return when they
+        /// succeed.
+        SUCCESS = 0,
+        /// The file does not start with OpenEXR's magic number.
+        INVALID_MAGIC_NUMBER = -1,
+        /// The file is not of version 2 of the format.
+        INVALID_EXR_VERSION = -2,
+        /// An argument is invalid.
+        INVALID_ARGUMENT = -3,
+        /// The file's data is invalid.
+        INVALID_DATA = -4,
+        /// The file is invalid.
+        INVALID_FILE = -5,
+        /// A parameter is invalid.
+        INVALID_PARAMETER = -6,
+        /// The file is of a kind that is not supported.
+        UNSUPPORTED_FORMAT = -8,
+        /// The header is invalid.
+        INVALID_HEADER = -9,
+        /// The file uses a feature that is not supported.
+        UNSUPPORTED_FEATURE = -10,
+        /// The image could not be written.
+        SERIALIZATION_FAILED = -12,
+        /// A layer asked for is not in the file.
+        LAYER_NOT_FOUND = -13,
+        /// The image is too large.
+        DATA_TOO_LARGE = -14,
+    }
+}
+
+code! {
+    /// The type of a channel's values (`TINYEXR_PIXELTYPE_*`).
+    PixelType {
+        /// 32-bit unsigned integers.
+        UINT = 0,
+        /// 16-bit floats, halves.
+        HALF = 1,
+        /// 32-bit floats.
+        FLOAT = 2,
+    }
+}
+
+code! {
+    /// How the pixels of a file are compressed (`TINYEXR_COMPRESSIONTYPE_*`).
+    Compression {
+        /// Stored as they are.
+        NONE = 0,
+        /// Run-length encoded.
+        RLE = 1,
+        /// zlib, a line to a block.
+        ZIPS = 2,
+        /// zlib, 16 lines to a block.
+        ZIP = 3,
+        /// Wavelet and Huffman coded, 32 lines to a block.
+        PIZ = 4,
+        /// Lossy for floats (rounded to 24 bits), then zlib.
+        PXR24 = 5,
+        /// Lossy, halves in blocks of four by four.
+        B44 = 6,
+        /// B44, with flat blocks smaller.
+        B44A = 7,
+        /// DreamWorks Animation's lossy compression, 32 lines to a block, which tinyexr does
+        /// not have (the functions that end in `_as_tinyexr` refuse it as tinyexr does). The
+        /// `dwaCompressionLevel` attribute of a header, which
+        /// [`dwa_compression_level_attribute`] makes, says how lossy (45 without it).
+        DWAA = 8,
+        /// The same, 256 lines to a block.
+        DWAB = 9,
+        /// A tinyexr extension, of floats only, with the zfp library's coder; its settings
+        /// are in attributes of the header, which [`ZfpSettings`] makes.
+        ZFP = 128,
+    }
+}
+
+code! {
+    /// The levels of a tiled file (`TINYEXR_TILE_*_LEVEL(S)`).
+    TileLevelMode {
+        /// One level.
+        ONE_LEVEL = 0,
+        /// Mipmap levels: each half the size of the one before both ways.
+        MIPMAP_LEVELS = 1,
+        /// Ripmap levels: each half the size of another one way or the other.
+        RIPMAP_LEVELS = 2,
+    }
+}
+
+code! {
+    /// How the sizes of a tiled file's levels are rounded (`TINYEXR_TILE_ROUND_*`).
+    TileRoundingMode {
+        /// Rounded down.
+        ROUND_DOWN = 0,
+        /// Rounded up.
+        ROUND_UP = 1,
+    }
+}
 
 /// Why a file was refused: the original's error code and the message it gives with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExrError {
-    pub code: i32,
+    /// The original's error code.
+    pub code: ErrorCode,
+    /// The message the original gives with it, often several lines, each ended by a line
+    /// break.
     pub message: String,
 }
 
@@ -159,7 +221,7 @@ impl std::fmt::Display for ExrError {
             write!(
                 f,
                 "the .exr file could not be read or written (tinyexr's error {})",
-                self.code
+                self.code.0
             )
         } else {
             f.write_str(self.message.trim_end())
@@ -188,6 +250,7 @@ pub struct ExrVersion {
 /// `EXRAttribute`: an attribute of the header that the reader has no field for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Attribute {
+    /// Its name.
     pub name: String,
     /// The name of its type, such as `"string"` or `"box2i"`.
     pub type_name: String,
@@ -198,20 +261,28 @@ pub struct Attribute {
 /// `EXRChannelInfo`: a channel of a file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChannelInfo {
+    /// Its name, such as `"R"`.
     pub name: String,
-    /// One of the `PIXELTYPE_*`.
-    pub pixel_type: i32,
+    /// The type of its values in the file.
+    pub pixel_type: PixelType,
+    /// Its horizontal sampling: 1 for a value at every pixel.
     pub x_sampling: i32,
+    /// Its vertical sampling: 1 for a value on every line.
     pub y_sampling: i32,
+    /// 1 if its values are perceptually linear (which DWAA and DWAB take into account).
     pub p_linear: u8,
 }
 
-/// `EXRBox2i`.
+/// `EXRBox2i`: a rectangle of pixels, its corners included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Box2i {
+    /// The left edge.
     pub min_x: i32,
+    /// The top edge.
     pub min_y: i32,
+    /// The right edge (inclusive).
     pub max_x: i32,
+    /// The bottom edge (inclusive).
     pub max_y: i32,
 }
 
@@ -234,12 +305,12 @@ pub(crate) struct HeaderInfo {
     tiled: i32, // Non-zero if the part is tiled.
     tile_size_x: i32,
     tile_size_y: i32,
-    tile_level_mode: i32,
-    tile_rounding_mode: i32,
+    tile_level_mode: TileLevelMode,
+    tile_rounding_mode: TileRoundingMode,
 
     header_len: u32,
 
-    compression_type: i32,
+    compression_type: Compression,
 
     // required for multi-part or non-image files
     name: String,
@@ -272,9 +343,9 @@ pub fn half_to_float(h: u16) -> f32 {
     f32::from_bits(o)
 }
 
-/// The original's `float_to_half_full`: a float as a half, rounded to the nearest with a
+/// The original's `float_to_half`: a float as a half, rounded to the nearest with a
 /// half going up.
-pub fn float_to_half_full(f: f32) -> u16 {
+pub fn float_to_half(f: f32) -> u16 {
     let bits = f.to_bits();
     let f_mantissa = bits & 0x7fffff;
     let f_exponent = (bits >> 23) & 0xff;
@@ -443,7 +514,7 @@ pub(crate) fn read_channel_info(channels: &mut Vec<ChannelInfo>, data: &[u8]) ->
 
         channels.push(ChannelInfo {
             name,
-            pixel_type,
+            pixel_type: PixelType(pixel_type),
             x_sampling,
             y_sampling,
             p_linear,
@@ -463,7 +534,7 @@ pub(crate) fn parse_exr_header(
     err: &mut String,
     buf: &[u8],
     as_tinyexr: bool,
-) -> Result<(), i32> {
+) -> Result<(), ErrorCode> {
     let mut size = buf.len();
     let mut marker = 0usize;
 
@@ -510,8 +581,8 @@ pub(crate) fn parse_exr_header(
     info.tiled = 0;
     info.tile_size_x = -1;
     info.tile_size_y = -1;
-    info.tile_level_mode = -1;
-    info.tile_rounding_mode = -1;
+    info.tile_level_mode = TileLevelMode(-1);
+    info.tile_rounding_mode = TileRoundingMode(-1);
 
     info.attributes.clear();
 
@@ -520,7 +591,7 @@ pub(crate) fn parse_exr_header(
     for _nattr in 0..MAX_HEADER_ATTRIBUTES {
         if 0 == size {
             err.push_str("Insufficient data size for attributes.\n");
-            return Err(ERROR_INVALID_DATA);
+            return Err(ErrorCode::INVALID_DATA);
         } else if buf[marker] == 0 {
             size -= 1;
             break;
@@ -530,7 +601,7 @@ pub(crate) fn parse_exr_header(
             read_attribute(&buf[marker..marker + size])
         else {
             err.push_str("Failed to read attribute.\n");
-            return Err(ERROR_INVALID_DATA);
+            return Err(ErrorCode::INVALID_DATA);
         };
         marker += marker_size;
         size -= marker_size;
@@ -550,7 +621,7 @@ pub(crate) fn parse_exr_header(
         if (version.tiled || version.multipart || version.non_image) && attr_name == "tiles" {
             if data.len() != 9 {
                 err.push_str("(ParseEXRHeader) Invalid attribute data size. Attribute data size must be 9.\n");
-                return Err(ERROR_INVALID_DATA);
+                return Err(ErrorCode::INVALID_DATA);
             }
 
             let x_size = int_at(&data, 0) as u32;
@@ -559,47 +630,46 @@ pub(crate) fn parse_exr_header(
 
             if x_size > i32::MAX as u32 || y_size > i32::MAX as u32 {
                 *err = "Tile sizes were invalid.".to_string();
-                return Err(ERROR_UNSUPPORTED_FORMAT);
+                return Err(ErrorCode::UNSUPPORTED_FORMAT);
             }
             info.tile_size_x = x_size as i32;
             info.tile_size_y = y_size as i32;
 
             // mode = levelMode + roundingMode * 16
-            info.tile_level_mode = (tile_mode & 0x3) as i32;
-            info.tile_rounding_mode = ((tile_mode >> 4) & 0x1) as i32;
+            info.tile_level_mode = TileLevelMode((tile_mode & 0x3) as i32);
+            info.tile_rounding_mode = TileRoundingMode(((tile_mode >> 4) & 0x1) as i32);
             info.tiled = 1;
         } else if attr_name == "compression" {
             let mut ok = false;
-            let compression = data[0] as i32;
-            if compression < COMPRESSIONTYPE_PIZ {
+            let compression = Compression(i32::from(data[0]));
+            if compression < Compression::PIZ {
                 ok = true;
             }
 
-            if compression == COMPRESSIONTYPE_PIZ {
+            if compression == Compression::PIZ {
                 ok = true;
             }
 
-            if compression == COMPRESSIONTYPE_ZFP {
+            if compression == Compression::ZFP {
                 ok = true;
             }
 
-            if compression == COMPRESSIONTYPE_PXR24
-                || compression == COMPRESSIONTYPE_B44
-                || compression == COMPRESSIONTYPE_B44A
+            if compression == Compression::PXR24
+                || compression == Compression::B44
+                || compression == Compression::B44A
             {
                 ok = true;
             }
 
             // (Not in the original.)
-            if !as_tinyexr
-                && (compression == COMPRESSIONTYPE_DWAA || compression == COMPRESSIONTYPE_DWAB)
+            if !as_tinyexr && (compression == Compression::DWAA || compression == Compression::DWAB)
             {
                 ok = true;
             }
 
             if !ok {
                 *err = "Unknown compression type.".to_string();
-                return Err(ERROR_UNSUPPORTED_FORMAT);
+                return Err(ErrorCode::UNSUPPORTED_FORMAT);
             }
 
             info.compression_type = compression;
@@ -613,12 +683,12 @@ pub(crate) fn parse_exr_header(
             // ySampling: int
             if !read_channel_info(&mut info.channels, &data) {
                 err.push_str("Failed to parse channel info.\n");
-                return Err(ERROR_INVALID_DATA);
+                return Err(ErrorCode::INVALID_DATA);
             }
 
             if info.channels.is_empty() {
                 err.push_str("# of channels is zero.\n");
-                return Err(ERROR_INVALID_DATA);
+                return Err(ErrorCode::INVALID_DATA);
             }
 
             has_channels = true;
@@ -731,7 +801,7 @@ pub(crate) fn parse_exr_header(
 
         if !ss_err.is_empty() {
             err.push_str(&ss_err);
-            return Err(ERROR_INVALID_HEADER);
+            return Err(ErrorCode::INVALID_HEADER);
         }
     }
 
@@ -745,45 +815,58 @@ pub use decode::ChannelData;
 /// `EXRHeader`: what the header of a file says.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExrHeader {
+    /// The `pixelAspectRatio` attribute.
     pub pixel_aspect_ratio: f32,
+    /// The `lineOrder` attribute: 0 for increasing y, 1 for decreasing, 2 for random.
     pub line_order: i32,
+    /// The `dataWindow` attribute: the pixels the file holds.
     pub data_window: Box2i,
+    /// The `displayWindow` attribute.
     pub display_window: Box2i,
+    /// The `screenWindowCenter` attribute.
     pub screen_window_center: [f32; 2],
+    /// The `screenWindowWidth` attribute.
     pub screen_window_width: f32,
 
+    /// The `chunkCount` attribute of a part of a file of several parts.
     pub chunk_count: i32,
 
-    // Properties for tiled format (`tiledesc`).
+    /// 1 if the image is tiled (`tiles` attribute).
     pub tiled: i32,
+    /// The width of a tile.
     pub tile_size_x: i32,
+    /// The height of a tile.
     pub tile_size_y: i32,
-    /// One of the `TILE_*_LEVELS`.
-    pub tile_level_mode: i32,
-    /// `TILE_ROUND_DOWN` or `TILE_ROUND_UP`.
-    pub tile_rounding_mode: i32,
+    /// Whether a tiled image has one level, mip levels or rip levels.
+    pub tile_level_mode: TileLevelMode,
+    /// How the sizes of a tiled image's further levels are rounded.
+    pub tile_rounding_mode: TileRoundingMode,
 
+    /// 1 if attribute and channel names may be longer than 31 bytes.
     pub long_name: i32,
-    // For a single-part file, agree with the version field bit 11; for a multi-part file,
-    // agree with each OpenEXR Data Type name ("deepscanline" or "deeptile").
+    /// 1 for a deep image. (For a file of one part this follows bit 11 of the version; for
+    /// a part of several, its `type` attribute, `"deepscanline"` or `"deeptile"`.)
     pub non_image: i32,
+    /// 1 for a part of a file of several parts.
     pub multipart: i32,
+    /// The length of the header in bytes, as it was read.
     pub header_len: u32,
 
     /// The attributes the reader has no field for (up to 128 of them).
     pub custom_attributes: Vec<Attribute>,
 
+    /// The channels, in the order the file has them (by name).
     pub channels: Vec<ChannelInfo>,
 
     /// The type of each channel's values as they were loaded: its type in the file until
     /// the image is read, the type that was asked for afterwards.
-    pub pixel_types: Vec<i32>,
+    pub pixel_types: Vec<PixelType>,
 
-    /// One of the `COMPRESSIONTYPE_*`.
-    pub compression_type: i32,
+    /// How the pixels are compressed.
+    pub compression_type: Compression,
     /// The type to read each channel's values as: its type in the file, which can be
-    /// changed to `PIXELTYPE_FLOAT` for a channel of halves before the image is read.
-    pub requested_pixel_types: Vec<i32>,
+    /// changed to `PixelType::FLOAT` for a channel of halves before the image is read.
+    pub requested_pixel_types: Vec<PixelType>,
 
     /// The name attribute, which a multipart file's parts need.
     pub name: String,
@@ -792,9 +875,13 @@ pub struct ExrHeader {
 /// `EXRTile`: a tile of a tiled image.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExrTile {
+    /// Which tile across its level it is.
     pub offset_x: i32,
+    /// Which tile down its level it is.
     pub offset_y: i32,
+    /// The level across it belongs to.
     pub level_x: i32,
+    /// The level down it belongs to.
     pub level_y: i32,
 
     /// The actual width in a tile.
@@ -815,32 +902,37 @@ pub struct ExrImage {
     pub tiles: Vec<ExrTile>,
     /// The next level of a tiled image with mip or rip levels.
     pub next_level: Option<Box<ExrImage>>,
+    /// The level across this is, for a tiled image.
     pub level_x: i32,
+    /// The level down this is, for a tiled image.
     pub level_y: i32,
 
     /// The values of each channel, for a file of scanlines: `width` by `height`.
     pub images: Vec<ChannelData>,
 
+    /// The width of the image (or of this level) in pixels.
     pub width: i32,
+    /// The height of the image (or of this level) in pixels.
     pub height: i32,
+    /// How many channels it has.
     pub num_channels: i32,
 }
 
 /// `ParseEXRVersionFromMemory`: the eight bytes a file starts with. The error is the
 /// original's code.
-pub fn parse_exr_version_from_memory(memory: &[u8]) -> Result<ExrVersion, i32> {
+pub fn parse_version(memory: &[u8]) -> Result<ExrVersion, ErrorCode> {
     if memory.len() < 8 {
-        return Err(ERROR_INVALID_DATA);
+        return Err(ErrorCode::INVALID_DATA);
     }
 
     // Header check.
     if memory[..4] != [0x76, 0x2f, 0x31, 0x01] {
-        return Err(ERROR_INVALID_MAGIC_NUMBER);
+        return Err(ErrorCode::INVALID_MAGIC_NUMBER);
     }
 
     // version, scanline: must be 2.
     if memory[4] != 2 {
-        return Err(ERROR_INVALID_EXR_VERSION);
+        return Err(ErrorCode::INVALID_EXR_VERSION);
     }
 
     let flags = memory[5];
@@ -853,9 +945,9 @@ pub fn parse_exr_version_from_memory(memory: &[u8]) -> Result<ExrVersion, i32> {
     })
 }
 
-/// `IsEXRFromMemory`.
-pub fn is_exr_from_memory(memory: &[u8]) -> bool {
-    parse_exr_version_from_memory(memory).is_ok()
+/// Whether `memory` starts with the version of a `.exr` file (`IsEXRFromMemory`).
+pub fn is_exr(memory: &[u8]) -> bool {
+    parse_version(memory).is_ok()
 }
 
 /// `ConvertHeader`: a parsed header as an `ExrHeader`. `None`, with the reason added to
@@ -951,30 +1043,24 @@ pub(crate) fn convert_header(
 }
 
 /// `ParseEXRHeaderFromMemory`: the header of a file of one part.
-pub fn parse_exr_header_from_memory(
-    version: &ExrVersion,
-    memory: &[u8],
-) -> Result<ExrHeader, ExrError> {
-    parse_header(version, memory, false)
+pub fn parse_header(version: &ExrVersion, memory: &[u8]) -> Result<ExrHeader, ExrError> {
+    parse_header_with(version, memory, false)
 }
 
 /// `ParseEXRHeaderFromMemory` exactly as tinyexr has it, which refuses DWAA and DWAB
 /// ("Unknown compression type.").
-pub fn parse_exr_header_from_memory_as_tinyexr(
-    version: &ExrVersion,
-    memory: &[u8],
-) -> Result<ExrHeader, ExrError> {
-    parse_header(version, memory, true)
+pub fn parse_header_as_tinyexr(version: &ExrVersion, memory: &[u8]) -> Result<ExrHeader, ExrError> {
+    parse_header_with(version, memory, true)
 }
 
-fn parse_header(
+fn parse_header_with(
     version: &ExrVersion,
     memory: &[u8],
     as_tinyexr: bool,
 ) -> Result<ExrHeader, ExrError> {
     let (exr_header, code, message) =
         parse_exr_header_from_memory_whole(version, memory, as_tinyexr);
-    if code != 0 {
+    if code != ErrorCode::SUCCESS {
         return Err(ExrError { code, message });
     }
     Ok(exr_header)
@@ -986,12 +1072,12 @@ fn parse_exr_header_from_memory_whole(
     version: &ExrVersion,
     memory: &[u8],
     as_tinyexr: bool,
-) -> (ExrHeader, i32, String) {
+) -> (ExrHeader, ErrorCode, String) {
     let mut err = String::new();
     if memory.len() < 8 {
         return (
             ExrHeader::default(),
-            ERROR_INVALID_DATA,
+            ErrorCode::INVALID_DATA,
             "Insufficient header/data size.\n".to_string(),
         );
     }
@@ -1000,7 +1086,7 @@ fn parse_exr_header_from_memory_whole(
 
     let mut info = HeaderInfo::default();
 
-    let mut ret = 0;
+    let mut ret = ErrorCode::SUCCESS;
     {
         let mut err_str = String::new();
         if let Err(code) = parse_exr_header(
@@ -1031,7 +1117,7 @@ fn parse_exr_header_from_memory_whole(
                 if !err_str.is_empty() {
                     err = err_str;
                 }
-                ret = ERROR_INVALID_HEADER;
+                ret = ErrorCode::INVALID_HEADER;
             }
         }
     }
@@ -1047,16 +1133,13 @@ fn parse_exr_header_from_memory_whole(
 /// `exr_header.pixel_types` says the same.
 ///
 /// A PXR24, B44 or B44A block that is as long as its pixels is read as the pixels, which is
-/// the format's rule and not tinyexr's: see [`load_exr_image_from_memory_as_tinyexr`].
-pub fn load_exr_image_from_memory(
-    exr_header: &mut ExrHeader,
-    memory: &[u8],
-) -> Result<ExrImage, ExrError> {
-    load_image(exr_header, memory, false)
+/// the format's rule and not tinyexr's: see [`load_image_as_tinyexr`].
+pub fn load_image(exr_header: &mut ExrHeader, memory: &[u8]) -> Result<ExrImage, ExrError> {
+    load_image_with(exr_header, memory, false)
 }
 
 /// `LoadEXRImageFromMemory` exactly as tinyexr has it, for every file, which
-/// [`load_exr_image_from_memory`] is but for two kinds of block:
+/// [`load_image`] is but for two kinds of block:
 ///
 /// - tinyexr reads a B44 or B44A block as B44 whatever its length. The format has a block
 ///   that would not come out smaller stored as its pixels, line after line, and OpenEXR
@@ -1065,28 +1148,28 @@ pub fn load_exr_image_from_memory(
 /// - tinyexr takes a PXR24 block as long as its values in PXR24's own layout for one that
 ///   was not compressed, which no writer makes; a compressed block that happens to come out
 ///   that long is read as other values, including one tinyexr wrote itself.
-pub fn load_exr_image_from_memory_as_tinyexr(
+pub fn load_image_as_tinyexr(
     exr_header: &mut ExrHeader,
     memory: &[u8],
 ) -> Result<ExrImage, ExrError> {
-    load_image(exr_header, memory, true)
+    load_image_with(exr_header, memory, true)
 }
 
-fn load_image(
+fn load_image_with(
     exr_header: &mut ExrHeader,
     memory: &[u8],
     as_tinyexr: bool,
 ) -> Result<ExrImage, ExrError> {
     if memory.len() < 8 {
         return Err(ExrError {
-            code: ERROR_INVALID_ARGUMENT,
+            code: ErrorCode::INVALID_ARGUMENT,
             message: "Invalid argument for LoadEXRImageFromMemory".to_string(),
         });
     }
 
     if exr_header.header_len == 0 {
         return Err(ExrError {
-            code: ERROR_INVALID_ARGUMENT,
+            code: ErrorCode::INVALID_ARGUMENT,
             message: "EXRHeader variable is not initialized.".to_string(),
         });
     }
@@ -1102,7 +1185,7 @@ fn load_image(
         &mut err,
         as_tinyexr,
     );
-    if ret != 0 {
+    if ret != ErrorCode::SUCCESS {
         return Err(ExrError {
             code: ret,
             message: err,
@@ -1117,45 +1200,56 @@ fn value_as_float(image: &ChannelData, index: usize) -> f32 {
     match image {
         ChannelData::Float(values) => values[index],
         ChannelData::Uint(values) => f32::from_bits(values[index]),
-        // (Not asked for by `load_exr_from_memory`, which reads halves as floats.)
+        // (Not asked for by `load_rgba`, which reads halves as floats.)
         ChannelData::Half(values) => half_to_float(values[index]),
     }
 }
 
-/// `LoadEXRFromMemory`: a file as floats of red, green, blue and alpha, with its width and
-/// height. A file of one channel gives that channel four times; any other needs channels
-/// named `R`, `G` and `B`, and its alpha is 1 where it has no `A`.
-pub fn load_exr_from_memory(memory: &[u8]) -> Result<(Vec<f32>, i32, i32), ExrError> {
-    load_rgba(memory, false)
+/// An image as floats of red, green, blue and alpha, as [`load_rgba`] gives it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RgbaImage {
+    /// The width in pixels.
+    pub width: i32,
+    /// The height in pixels.
+    pub height: i32,
+    /// Four floats a pixel (red, green, blue, alpha), line by line from the top.
+    pub data: Vec<f32>,
+}
+
+/// `LoadEXRFromMemory`: a file as floats of red, green, blue and alpha. A file of one
+/// channel gives that channel four times; any other needs channels named `R`, `G` and `B`,
+/// and its alpha is 1 where it has no `A`.
+pub fn load_rgba(memory: &[u8]) -> Result<RgbaImage, ExrError> {
+    load_rgba_with(memory, false)
 }
 
 /// `LoadEXRFromMemory` exactly as tinyexr has it
-/// ([`load_exr_image_from_memory_as_tinyexr`] says where that differs).
-pub fn load_exr_from_memory_as_tinyexr(memory: &[u8]) -> Result<(Vec<f32>, i32, i32), ExrError> {
-    load_rgba(memory, true)
+/// ([`load_image_as_tinyexr`] says where that differs).
+pub fn load_rgba_as_tinyexr(memory: &[u8]) -> Result<RgbaImage, ExrError> {
+    load_rgba_with(memory, true)
 }
 
-fn load_rgba(memory: &[u8], as_tinyexr: bool) -> Result<(Vec<f32>, i32, i32), ExrError> {
-    let exr_version = match parse_exr_version_from_memory(memory) {
+fn load_rgba_with(memory: &[u8], as_tinyexr: bool) -> Result<RgbaImage, ExrError> {
+    let exr_version = match parse_version(memory) {
         Ok(version) => version,
         Err(code) => {
             return Err(ExrError {
                 code,
-                message: format!("Failed to parse EXR version. code({code})"),
+                message: format!("Failed to parse EXR version. code({})", code.0),
             });
         }
     };
 
-    let mut exr_header = parse_header(&exr_version, memory, as_tinyexr)?;
+    let mut exr_header = parse_header_with(&exr_version, memory, as_tinyexr)?;
 
     // Read HALF channel as FLOAT.
     for i in 0..exr_header.channels.len() {
-        if exr_header.pixel_types[i] == PIXELTYPE_HALF {
-            exr_header.requested_pixel_types[i] = PIXELTYPE_FLOAT;
+        if exr_header.pixel_types[i] == PixelType::HALF {
+            exr_header.requested_pixel_types[i] = PixelType::FLOAT;
         }
     }
 
-    let exr_image = load_image(&mut exr_header, memory, as_tinyexr)?;
+    let exr_image = load_image_with(&mut exr_header, memory, as_tinyexr)?;
 
     // RGBA
     let mut idx_r = -1i32;
@@ -1177,21 +1271,21 @@ fn load_rgba(memory: &[u8], as_tinyexr: bool) -> Result<(Vec<f32>, i32, i32), Ex
         // Assume RGB(A)
         if idx_r == -1 {
             return Err(ExrError {
-                code: ERROR_INVALID_DATA,
+                code: ErrorCode::INVALID_DATA,
                 message: "R channel not found".to_string(),
             });
         }
 
         if idx_g == -1 {
             return Err(ExrError {
-                code: ERROR_INVALID_DATA,
+                code: ErrorCode::INVALID_DATA,
                 message: "G channel not found".to_string(),
             });
         }
 
         if idx_b == -1 {
             return Err(ExrError {
-                code: ERROR_INVALID_DATA,
+                code: ErrorCode::INVALID_DATA,
                 message: "B channel not found".to_string(),
             });
         }
@@ -1261,7 +1355,11 @@ fn load_rgba(memory: &[u8], as_tinyexr: bool) -> Result<(Vec<f32>, i32, i32), Ex
         }
     }
 
-    Ok((out_rgba, exr_image.width, exr_image.height))
+    Ok(RgbaImage {
+        width: exr_image.width,
+        height: exr_image.height,
+        data: out_rgba,
+    })
 }
 
 #[cfg(test)]
@@ -1286,7 +1384,7 @@ mod tests {
         for name in ["B", "G", "R"] {
             channels.extend_from_slice(name.as_bytes());
             channels.push(0);
-            channels.extend_from_slice(&PIXELTYPE_HALF.to_le_bytes());
+            channels.extend_from_slice(&PixelType::HALF.0.to_le_bytes());
             channels.extend_from_slice(&[0, 0, 0, 0]);
             channels.extend_from_slice(&1i32.to_le_bytes());
             channels.extend_from_slice(&1i32.to_le_bytes());
@@ -1330,7 +1428,11 @@ mod tests {
         let pixels = [[one, half, two], [0, 0, 0], [two, two, two], [half, one, 0]];
         let file = file_by_hand(&pixels);
 
-        let (rgba, width, height) = load_exr_from_memory(&file).unwrap();
+        let RgbaImage {
+            width,
+            height,
+            data: rgba,
+        } = load_rgba(&file).unwrap();
         assert_eq!((width, height), (2, 2));
         assert_eq!(
             rgba,
@@ -1340,9 +1442,9 @@ mod tests {
         );
 
         // And channel by channel, as it is stored.
-        let version = parse_exr_version_from_memory(&file).unwrap();
+        let version = parse_version(&file).unwrap();
         assert!(!version.tiled && !version.multipart && !version.non_image);
-        let mut header = parse_exr_header_from_memory(&version, &file).unwrap();
+        let mut header = parse_header(&version, &file).unwrap();
         assert_eq!(
             header
                 .channels
@@ -1351,8 +1453,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["B", "G", "R"]
         );
-        assert_eq!(header.compression_type, COMPRESSIONTYPE_NONE);
-        let image = load_exr_image_from_memory(&mut header, &file).unwrap();
+        assert_eq!(header.compression_type, Compression::NONE);
+        let image = load_image(&mut header, &file).unwrap();
         assert_eq!((image.width, image.height), (2, 2));
         assert_eq!(image.images[2], ChannelData::Half(vec![one, 0, two, half]));
         assert_eq!(image.images[0], ChannelData::Half(vec![two, 0, two, 0]));
@@ -1361,21 +1463,21 @@ mod tests {
     #[test]
     fn a_file_that_is_not_one_is_refused_with_tinyexrs_code() {
         assert_eq!(
-            parse_exr_version_from_memory(b"\x89PNG\r\n\x1a\n"),
-            Err(ERROR_INVALID_MAGIC_NUMBER)
+            parse_version(b"\x89PNG\r\n\x1a\n"),
+            Err(ErrorCode::INVALID_MAGIC_NUMBER)
         );
         assert_eq!(
-            parse_exr_version_from_memory(&[0x76, 0x2f, 0x31]),
-            Err(ERROR_INVALID_DATA)
+            parse_version(&[0x76, 0x2f, 0x31]),
+            Err(ErrorCode::INVALID_DATA)
         );
-        let error = load_exr_from_memory(b"not an .exr file").unwrap_err();
-        assert_eq!(error.code, ERROR_INVALID_MAGIC_NUMBER);
+        let error = load_rgba(b"not an .exr file").unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_MAGIC_NUMBER);
         assert_eq!(error.message, "Failed to parse EXR version. code(-1)");
 
         // Cut off within its last block.
         let file = file_by_hand(&[[0; 3]; 4]);
-        let error = load_exr_from_memory(&file[..file.len() - 4]).unwrap_err();
-        assert_eq!(error.code, ERROR_INVALID_DATA);
+        let error = load_rgba(&file[..file.len() - 4]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_DATA);
     }
 
     /// An image of scanlines, `width` by `height`, of channels B, G and R as `values` gives
@@ -1383,10 +1485,10 @@ mod tests {
     fn image_of(
         width: i32,
         height: i32,
-        compression_type: i32,
+        compression_type: Compression,
         values: impl Fn(usize, usize) -> ChannelData,
-        file_type: i32,
-        memory_type: i32,
+        file_type: PixelType,
+        memory_type: PixelType,
     ) -> (ExrImage, ExrHeader) {
         let image = ExrImage {
             images: (0..3)
@@ -1417,12 +1519,12 @@ mod tests {
     }
 
     fn read(file: &[u8], as_tinyexr: bool) -> ExrImage {
-        let version = parse_exr_version_from_memory(file).unwrap();
-        let mut header = parse_exr_header_from_memory(&version, file).unwrap();
+        let version = parse_version(file).unwrap();
+        let mut header = parse_header(&version, file).unwrap();
         if as_tinyexr {
-            load_exr_image_from_memory_as_tinyexr(&mut header, file).unwrap()
+            load_image_as_tinyexr(&mut header, file).unwrap()
         } else {
-            load_exr_image_from_memory(&mut header, file).unwrap()
+            load_image(&mut header, file).unwrap()
         }
     }
 
@@ -1440,17 +1542,21 @@ mod tests {
                     .collect(),
             )
         };
-        for compression_type in [COMPRESSIONTYPE_DWAA, COMPRESSIONTYPE_DWAB] {
+        for compression_type in [Compression::DWAA, Compression::DWAB] {
             let (image, mut header) = image_of(
                 70,
                 300,
                 compression_type,
                 smooth,
-                PIXELTYPE_HALF,
-                PIXELTYPE_FLOAT,
+                PixelType::HALF,
+                PixelType::FLOAT,
             );
-            let file = save_exr_image_to_memory(&image, &header).unwrap();
-            let (rgba, width, height) = load_exr_from_memory(&file).unwrap();
+            let file = save_image(&image, &header).unwrap();
+            let RgbaImage {
+                width,
+                height,
+                data: rgba,
+            } = load_rgba(&file).unwrap();
             assert_eq!((width, height), (70, 300));
             let ChannelData::Float(red) = &image.images[2] else {
                 unreachable!()
@@ -1461,38 +1567,36 @@ mod tests {
                     .iter()
                     .zip(red)
                     .all(|(pixel, red)| (pixel[0] - red).abs() < 0.02 && pixel[3] == 1.0),
-                "compression {compression_type}"
+                "compression {compression_type:?}"
             );
             let (_, plain) = image_of(
                 70,
                 300,
-                COMPRESSIONTYPE_NONE,
+                Compression::NONE,
                 smooth,
-                PIXELTYPE_HALF,
-                PIXELTYPE_FLOAT,
+                PixelType::HALF,
+                PixelType::FLOAT,
             );
-            assert!(file.len() * 3 < save_exr_image_to_memory(&image, &plain).unwrap().len());
+            assert!(file.len() * 3 < save_image(&image, &plain).unwrap().len());
 
             // tinyexr knows neither: it writes no such file, and reads none.
-            assert!(save_exr_image_to_memory_as_tinyexr(&image, &header).is_err());
-            let version = parse_exr_version_from_memory(&file).unwrap();
-            let refused = parse_exr_header_from_memory_as_tinyexr(&version, &file).unwrap_err();
+            assert!(save_image_as_tinyexr(&image, &header).is_err());
+            let version = parse_version(&file).unwrap();
+            let refused = parse_header_as_tinyexr(&version, &file).unwrap_err();
             assert_eq!(
                 (refused.code, refused.message.as_str()),
-                (ERROR_UNSUPPORTED_FORMAT, "Unknown compression type.")
+                (ErrorCode::UNSUPPORTED_FORMAT, "Unknown compression type.")
             );
-            assert!(load_exr_from_memory_as_tinyexr(&file).is_err());
+            assert!(load_rgba_as_tinyexr(&file).is_err());
 
             // The level of loss, as OpenEXR bounds it.
             header.custom_attributes = vec![dwa_compression_level_attribute(-1.0)];
             assert_eq!(
-                save_exr_image_to_memory(&image, &header)
-                    .unwrap_err()
-                    .message,
+                save_image(&image, &header).unwrap_err().message,
                 DWA_INVALID_LEVEL
             );
             header.custom_attributes = vec![dwa_compression_level_attribute(0.0)];
-            let lossless_quantization = save_exr_image_to_memory(&image, &header).unwrap();
+            let lossless_quantization = save_image(&image, &header).unwrap();
             assert!(lossless_quantization.len() > file.len());
         }
     }
@@ -1507,13 +1611,13 @@ mod tests {
             )
         };
         for compression_type in [
-            COMPRESSIONTYPE_NONE,
-            COMPRESSIONTYPE_RLE,
-            COMPRESSIONTYPE_ZIPS,
-            COMPRESSIONTYPE_ZIP,
-            COMPRESSIONTYPE_PIZ,
-            COMPRESSIONTYPE_B44,
-            COMPRESSIONTYPE_B44A,
+            Compression::NONE,
+            Compression::RLE,
+            Compression::ZIPS,
+            Compression::ZIP,
+            Compression::PIZ,
+            Compression::B44,
+            Compression::B44A,
         ] {
             // (B44 leaves floats as they are.)
             let (image, header) = image_of(
@@ -1521,14 +1625,14 @@ mod tests {
                 40,
                 compression_type,
                 floats,
-                PIXELTYPE_FLOAT,
-                PIXELTYPE_FLOAT,
+                PixelType::FLOAT,
+                PixelType::FLOAT,
             );
-            let file = save_exr_image_to_memory(&image, &header).unwrap();
+            let file = save_image(&image, &header).unwrap();
             assert_eq!(
                 read(&file, false).images,
                 image.images,
-                "compression {compression_type}"
+                "compression {compression_type:?}"
             );
             // And as halves, which these values all are.
             let (_, header) = image_of(
@@ -1536,13 +1640,17 @@ mod tests {
                 40,
                 compression_type,
                 floats,
-                PIXELTYPE_HALF,
-                PIXELTYPE_FLOAT,
+                PixelType::HALF,
+                PixelType::FLOAT,
             );
-            let file = save_exr_image_to_memory(&image, &header).unwrap();
-            let (rgba, width, height) = load_exr_from_memory(&file).unwrap();
+            let file = save_image(&image, &header).unwrap();
+            let RgbaImage {
+                width,
+                height,
+                data: rgba,
+            } = load_rgba(&file).unwrap();
             assert_eq!((width, height), (21, 40));
-            if compression_type != COMPRESSIONTYPE_B44 && compression_type != COMPRESSIONTYPE_B44A {
+            if compression_type != Compression::B44 && compression_type != Compression::B44A {
                 let ChannelData::Float(red) = &image.images[2] else {
                     unreachable!()
                 };
@@ -1552,7 +1660,7 @@ mod tests {
                         .iter()
                         .zip(red)
                         .all(|(pixel, red)| pixel[0] == *red && pixel[3] == 1.0),
-                    "compression {compression_type}"
+                    "compression {compression_type:?}"
                 );
             }
         }
@@ -1563,13 +1671,13 @@ mod tests {
         let (image, header) = image_of(
             21,
             40,
-            COMPRESSIONTYPE_PXR24,
+            Compression::PXR24,
             halves,
-            PIXELTYPE_HALF,
-            PIXELTYPE_HALF,
+            PixelType::HALF,
+            PixelType::HALF,
         );
         assert_eq!(
-            read(&save_exr_image_to_memory(&image, &header).unwrap(), false).images,
+            read(&save_image(&image, &header).unwrap(), false).images,
             image.images
         );
     }
@@ -1585,24 +1693,24 @@ mod tests {
         let (image, header) = image_of(
             5,
             3,
-            COMPRESSIONTYPE_B44,
+            Compression::B44,
             floats,
-            PIXELTYPE_FLOAT,
-            PIXELTYPE_FLOAT,
+            PixelType::FLOAT,
+            PixelType::FLOAT,
         );
-        let file = save_exr_image_to_memory(&image, &header).unwrap();
-        let as_tinyexr = save_exr_image_to_memory_as_tinyexr(&image, &header).unwrap();
+        let file = save_image(&image, &header).unwrap();
+        let as_tinyexr = save_image_as_tinyexr(&image, &header).unwrap();
         assert_eq!(file.len(), as_tinyexr.len());
         assert_ne!(file, as_tinyexr);
         let (_, plain_header) = image_of(
             5,
             3,
-            COMPRESSIONTYPE_NONE,
+            Compression::NONE,
             floats,
-            PIXELTYPE_FLOAT,
-            PIXELTYPE_FLOAT,
+            PixelType::FLOAT,
+            PixelType::FLOAT,
         );
-        let plain = save_exr_image_to_memory(&image, &plain_header).unwrap();
+        let plain = save_image(&image, &plain_header).unwrap();
         // (A B44 block holds the three lines and a plain one a line, each 60 bytes after the
         // 8 the block starts with: the first line's pixels are the same bytes in both.)
         assert_eq!(
@@ -1622,13 +1730,13 @@ mod tests {
         let (image, header) = image_of(
             2,
             1,
-            COMPRESSIONTYPE_PXR24,
+            Compression::PXR24,
             halves,
-            PIXELTYPE_HALF,
-            PIXELTYPE_HALF,
+            PixelType::HALF,
+            PixelType::HALF,
         );
-        let file = save_exr_image_to_memory(&image, &header).unwrap();
-        let as_tinyexr = save_exr_image_to_memory_as_tinyexr(&image, &header).unwrap();
+        let file = save_image(&image, &header).unwrap();
+        let as_tinyexr = save_image_as_tinyexr(&image, &header).unwrap();
         assert!(file.len() < as_tinyexr.len());
         assert_eq!(read(&file, false).images, image.images);
         assert_eq!(read(&as_tinyexr, true).images, image.images);
@@ -1642,59 +1750,62 @@ mod tests {
         let (image, header) = image_of(
             4,
             4,
-            COMPRESSIONTYPE_ZIP,
+            Compression::ZIP,
             floats,
-            PIXELTYPE_FLOAT,
-            PIXELTYPE_FLOAT,
+            PixelType::FLOAT,
+            PixelType::FLOAT,
         );
-        assert!(save_exr_image_to_memory(&image, &header).is_ok());
+        assert!(save_image(&image, &header).is_ok());
         // A channel short of a value; a type that is not the values'; no size.
         let mut short = image.clone();
         short.images[1] = ChannelData::Float(vec![0.5; 15]);
         assert_eq!(
-            save_exr_image_to_memory(&short, &header).unwrap_err().code,
-            ERROR_INVALID_ARGUMENT
+            save_image(&short, &header).unwrap_err().code,
+            ErrorCode::INVALID_ARGUMENT
         );
         let mut other = header.clone();
-        other.pixel_types[0] = PIXELTYPE_HALF;
+        other.pixel_types[0] = PixelType::HALF;
         assert_eq!(
-            save_exr_image_to_memory(&image, &other).unwrap_err().code,
-            ERROR_INVALID_ARGUMENT
+            save_image(&image, &other).unwrap_err().code,
+            ErrorCode::INVALID_ARGUMENT
         );
         let mut flat = image.clone();
         flat.height = 0;
         assert_eq!(
-            save_exr_image_to_memory(&flat, &header).unwrap_err().code,
-            ERROR_INVALID_ARGUMENT
+            save_image(&flat, &header).unwrap_err().code,
+            ErrorCode::INVALID_ARGUMENT
         );
         // ZFP of a block that is not of whole blocks of four by four.
         let (odd, mut zfp) = image_of(
             6,
             4,
-            COMPRESSIONTYPE_ZFP,
+            Compression::ZFP,
             floats,
-            PIXELTYPE_FLOAT,
-            PIXELTYPE_FLOAT,
+            PixelType::FLOAT,
+            PixelType::FLOAT,
         );
         assert_eq!(
-            save_exr_image_to_memory(&odd, &zfp).unwrap_err().message,
+            save_image(&odd, &zfp).unwrap_err().message,
             ZFP_NOT_MULTIPLE_OF_FOUR
         );
         // And what the original refuses itself, with its message.
-        zfp.requested_pixel_types[1] = PIXELTYPE_HALF;
-        let error = save_exr_image_to_memory(&odd, &zfp).unwrap_err();
+        zfp.requested_pixel_types[1] = PixelType::HALF;
+        let error = save_image(&odd, &zfp).unwrap_err();
         assert_eq!(
             (error.code, error.message.as_str()),
             (
-                ERROR_SERIALIZATION_FAILED,
+                ErrorCode::SERIALIZATION_FAILED,
                 "Pixel type must be FLOAT for ZFP compression"
             )
         );
-        let error = save_exr_to_memory(&[0.0; 8], 2, 2, 2, false).unwrap_err();
+        let error = save_floats(&[0.0; 8], 2, 2, 2, false).unwrap_err();
         let _ = &image;
         assert_eq!(
             (error.code, error.message.as_str()),
-            (ERROR_INVALID_ARGUMENT, "Unsupported component value : 2\n")
+            (
+                ErrorCode::INVALID_ARGUMENT,
+                "Unsupported component value : 2\n"
+            )
         );
     }
 
@@ -1709,7 +1820,7 @@ mod tests {
             },
             tile_size_x: 4,
             tile_size_y: 4,
-            tile_level_mode: TILE_ONE_LEVEL,
+            tile_level_mode: TileLevelMode::ONE_LEVEL,
             ..ExrHeader::default()
         };
         assert_eq!(
@@ -1725,7 +1836,7 @@ mod tests {
         );
         // Ten pixels halve to five, two and one, rounded down; or to five, three, two and
         // one, rounded up.
-        header.tile_level_mode = TILE_MIPMAP_LEVELS;
+        header.tile_level_mode = TileLevelMode::MIPMAP_LEVELS;
         let sizes = |header: &ExrHeader| {
             tile_levels(header)
                 .unwrap()
@@ -1734,11 +1845,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(sizes(&header), [(10, 5), (5, 2), (2, 1), (1, 1)]);
-        header.tile_rounding_mode = TILE_ROUND_UP;
+        header.tile_rounding_mode = TileRoundingMode::ROUND_UP;
         assert_eq!(sizes(&header), [(10, 5), (5, 3), (3, 2), (2, 1), (1, 1)]);
         // Rip levels: every width with every height, row after row.
-        header.tile_level_mode = TILE_RIPMAP_LEVELS;
-        header.tile_rounding_mode = TILE_ROUND_DOWN;
+        header.tile_level_mode = TileLevelMode::RIPMAP_LEVELS;
+        header.tile_rounding_mode = TileRoundingMode::ROUND_DOWN;
         let levels = tile_levels(&header).unwrap();
         assert_eq!(levels.len(), 4 * 3);
         assert_eq!(
@@ -1776,11 +1887,11 @@ mod tests {
             (0xfc00, f32::NEG_INFINITY),
         ] {
             assert_eq!(half_to_float(half), float);
-            assert_eq!(float_to_half_full(float), half);
+            assert_eq!(float_to_half(float), half);
         }
         assert!(half_to_float(0x7e00).is_nan());
         // Too large for a half.
-        assert_eq!(float_to_half_full(1e10), 0x7c00);
+        assert_eq!(float_to_half(1e10), 0x7c00);
     }
 }
 
@@ -1788,3 +1899,8 @@ mod tests {
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+/// (And those of the Guide.)
+#[cfg(doctest)]
+#[doc = include_str!("../docs/guide.md")]
+struct GuideDoctests;

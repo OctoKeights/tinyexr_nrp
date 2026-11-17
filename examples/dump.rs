@@ -1,8 +1,8 @@
-//! The Rust half of the comparison with tinyexr: runs the port over made-up data and
+//! The Rust half of the comparison with tinyexr: runs the port over synthetic data and
 //! prints a running hash of what comes out, as `compare/dump_tinyexr.cc` does with the original.
 //! `compare/compare.sh` compares the two.
 //!
-//!   dump tinyexr_write <seed> <count>               made-up images saved as .exr files, and
+//!   dump tinyexr_write <seed> <count>               synthetic images saved as .exr files, and
 //!   dump tinyexr_write_small <seed> <count>         every fourth the short way as well
 //!   dump tinyexr_read <seed> <count> <file>         the .exr files that program wrote to the
 //!   dump tinyexr_read_small <seed> <count> <file>   file, each read four ways

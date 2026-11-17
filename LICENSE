@@ -1,8 +1,8 @@
 tinyexr_nrp is a native Rust port of tinyexr v3.4.0, by Syoyo Fujita and many
-contributors, which contains code from OpenEXR (https://github.com/syoyo/tinyexr). It is
-offered under the original's licence (the two licences at the head of tinyexr.h), which
-follows: the original's copyright notices are kept, and the port's own work, Copyright
-2026 OctoKeights, is offered under the same terms.
+contributors (https://github.com/syoyo/tinyexr), which contains code from OpenEXR. It is
+distributed under tinyexr's licence (the two licences at the head of tinyexr.h), which
+follows. tinyexr's copyright notices are retained, and the port's own work, Copyright 2026
+OctoKeights, is offered under the same terms.
 
 ------------------------------------------------------------------------------
 

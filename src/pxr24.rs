@@ -7,7 +7,7 @@
 
 use miniz_nrp as miniz;
 
-use super::{PIXELTYPE_HALF, PIXELTYPE_UINT};
+use super::PixelType;
 
 /// `DecompressPxr24`: a block of `num_lines` lines of `data_width` pixels into `out`, four
 /// bytes a value for integers and floats and two for halves. `pixel_types` are the channels'.
@@ -20,7 +20,7 @@ pub(crate) fn decompress_pxr24(
     input: &[u8],
     data_width: i32,
     num_lines: i32,
-    pixel_types: &[i32],
+    pixel_types: &[PixelType],
     as_tinyexr: bool,
 ) -> bool {
     // PXR24 stores data per-scanline, per-channel with byte planes: UINT in 4 bytes, HALF in
@@ -30,9 +30,9 @@ pub(crate) fn decompress_pxr24(
     let mut pxr24_size = 0usize;
     for &pixel_type in pixel_types {
         let ch_pixels = data_width.wrapping_mul(num_lines);
-        if pixel_type == PIXELTYPE_UINT {
+        if pixel_type == PixelType::UINT {
             pxr24_size += (ch_pixels as usize).wrapping_mul(4);
-        } else if pixel_type == PIXELTYPE_HALF {
+        } else if pixel_type == PixelType::HALF {
             pxr24_size += (ch_pixels as usize).wrapping_mul(2);
         } else {
             // FLOAT: 24 bits
@@ -63,7 +63,7 @@ pub(crate) fn decompress_pxr24(
 
     for _line in 0..num_lines {
         for &pixel_type in pixel_types {
-            if pixel_type == PIXELTYPE_UINT {
+            if pixel_type == PixelType::UINT {
                 // UINT: 4 byte planes with delta encoding.
                 let (ptr0, ptr1, ptr2, ptr3) = (in_p, in_p + w, in_p + w * 2, in_p + w * 3);
                 in_p += w * 4;
@@ -78,7 +78,7 @@ pub(crate) fn decompress_pxr24(
                     out[out_p..out_p + 4].copy_from_slice(&pixel.to_le_bytes());
                     out_p += 4;
                 }
-            } else if pixel_type == PIXELTYPE_HALF {
+            } else if pixel_type == PixelType::HALF {
                 // HALF: 2 byte planes with delta encoding.
                 let (ptr0, ptr1) = (in_p, in_p + w);
                 in_p += w * 2;
@@ -158,7 +158,7 @@ pub(crate) fn compress_pxr24(
     input: &[u8],
     data_width: i32,
     num_lines: i32,
-    file_types: &[i32],
+    file_types: &[PixelType],
 ) -> Vec<u8> {
     // Calculate PXR24 buffer size.
     // PXR24 converts FLOAT to 24-bit, HALF stays 16-bit, UINT stays 32-bit.
@@ -166,9 +166,9 @@ pub(crate) fn compress_pxr24(
     let mut pxr24_size = 0usize;
     for &file_type in file_types {
         let ch_pixels = (data_width * num_lines) as usize;
-        if file_type == PIXELTYPE_UINT {
+        if file_type == PixelType::UINT {
             pxr24_size += ch_pixels * 4;
-        } else if file_type == PIXELTYPE_HALF {
+        } else if file_type == PixelType::HALF {
             pxr24_size += ch_pixels * 2;
         } else {
             pxr24_size += ch_pixels * 3;
@@ -183,7 +183,7 @@ pub(crate) fn compress_pxr24(
     for _line in 0..num_lines {
         // Process each channel.
         for &file_type in file_types {
-            if file_type == PIXELTYPE_UINT {
+            if file_type == PixelType::UINT {
                 // UINT: 4 bytes, store as 4 separate byte planes with delta encoding.
                 let ptr = out_p;
                 out_p += w * 4;
@@ -206,7 +206,7 @@ pub(crate) fn compress_pxr24(
                     pxr24_buf[ptr + w * 2 + x] = (diff >> 8) as u8;
                     pxr24_buf[ptr + w * 3 + x] = diff as u8;
                 }
-            } else if file_type == PIXELTYPE_HALF {
+            } else if file_type == PixelType::HALF {
                 // HALF: 2 bytes, store as 2 separate byte planes with delta encoding.
                 let ptr = out_p;
                 out_p += w * 2;

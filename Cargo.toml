@@ -1,7 +1,7 @@
 [package]
 name = "tinyexr_nrp"
-description = "OpenEXR files read and written in pure, safe Rust: a native port of tinyexr, giving the files and values tinyexr gives, with DWAA and DWAB as OpenEXR has them."
-version = "0.1.0"
+description = "OpenEXR files read and written in pure, safe Rust: a native port of tinyexr, bit-identical to it, with DWAA and DWAB as OpenEXR has them."
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.100"
 license = "BSD-3-Clause"
@@ -13,4 +13,4 @@ categories = ["multimedia::images", "encoding"]
 [dependencies]
 miniz_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/miniz_nrp" }
 zfp_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/zfp_nrp" }
-openexr_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/openexr_nrp" }
+openexr_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/openexr_nrp" }

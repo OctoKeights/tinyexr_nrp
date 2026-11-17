@@ -17,13 +17,13 @@ use super::Attribute;
 use zfp_nrp::{BLOCK_LEN, BitStream, Settings};
 
 /// `TINYEXR_ZFP_COMPRESSIONTYPE_RATE`: so many bits a value.
-pub const ZFP_COMPRESSIONTYPE_RATE: i32 = 0;
+pub(crate) const ZFP_COMPRESSIONTYPE_RATE: i32 = 0;
 
 /// `TINYEXR_ZFP_COMPRESSIONTYPE_PRECISION`: so many planes of bits.
-pub const ZFP_COMPRESSIONTYPE_PRECISION: i32 = 1;
+pub(crate) const ZFP_COMPRESSIONTYPE_PRECISION: i32 = 1;
 
 /// `TINYEXR_ZFP_COMPRESSIONTYPE_ACCURACY`: an error no larger than a tolerance.
-pub const ZFP_COMPRESSIONTYPE_ACCURACY: i32 = 2;
+pub(crate) const ZFP_COMPRESSIONTYPE_ACCURACY: i32 = 2;
 
 /// The settings of ZFP compression, as the attributes a header carries them in (which tinyexr
 /// reads on both sides: without them, it writes at 2 bits a value, and does not read).

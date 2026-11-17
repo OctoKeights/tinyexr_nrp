@@ -3,7 +3,7 @@
 //!
 //! `tests/data/tinyexr_write_expected.txt` is what `compare/dump_tinyexr.cc` printed for
 //! `tinyexr_write_small 5 300` (see `compare/compare.sh`): a hash of the files tinyexr saves
-//! of made-up images, in scanlines and in tiles, with every compression it writes, or of its
+//! of synthetic images, in scanlines and in tiles, with every compression it writes, or of its
 //! message where it saves none.
 //!
 //! `tests/data/exr_files.bin` holds the files that program made with tinyexr for
@@ -14,7 +14,7 @@
 //! `tests/data/tinyexr_parts_expected.txt` is what it printed for `tinyexr_parts 7 60`: files
 //! of many parts saved, and read; `tests/data/exr_parts.bin` the files it read (a third of
 //! them damaged) with what came of each. `tests/data/tinyexr_deep_expected.txt` and
-//! `tests/data/exr_deep.bin` are the same for `tinyexr_deep 13 80`, of made-up deep files.
+//! `tests/data/exr_deep.bin` are the same for `tinyexr_deep 13 80`, of synthetic deep files.
 //!
 //! `tests/data/tinyexr_zfp_write_expected.txt` is what it printed for `tinyexr_zfp_write 5 300`,
 //! and `tests/data/tinyexr_zfp_read_expected.txt` for `tinyexr_zfp_read 11 100` (whose files
@@ -115,19 +115,17 @@ fn badly_damaged_parts_and_deep_files_are_read_or_refused() {
                     bytes.truncate(r.next() as usize % bytes.len());
                 }
                 if !with_wish {
-                    match tinyexr::load_deep_exr_from_memory(&bytes) {
+                    match tinyexr::load_deep(&bytes) {
                         Ok(_) => read += 1,
                         Err(_) => refused += 1,
                     }
                     continue;
                 }
-                let Ok(version) = tinyexr::parse_exr_version_from_memory(&bytes) else {
+                let Ok(version) = tinyexr::parse_version(&bytes) else {
                     refused += 1;
                     continue;
                 };
-                let Ok(mut headers) =
-                    tinyexr::parse_exr_multipart_header_from_memory(&version, &bytes)
-                else {
+                let Ok(mut headers) = tinyexr::parse_multipart_headers(&version, &bytes) else {
                     refused += 1;
                     continue;
                 };
@@ -135,7 +133,7 @@ fn badly_damaged_parts_and_deep_files_are_read_or_refused() {
                 if headers.iter().any(made_up::tinyexr_left) {
                     continue;
                 }
-                match tinyexr::load_exr_multipart_image_from_memory(&mut headers, &bytes) {
+                match tinyexr::load_multipart_images(&mut headers, &bytes) {
                     Ok(_) => read += 1,
                     Err(_) => refused += 1,
                 }
@@ -169,7 +167,7 @@ fn badly_damaged_files_are_read_or_refused() {
             if bytes.is_empty() {
                 continue;
             }
-            // A few bytes made up, more often near the start, where the header and the table
+            // A few bytes randomised, more often near the start, where the header and the table
             // of offsets are; now and then the end cut off.
             for _ in 0..1 + r.next() % 4 {
                 let within = if r.next().is_multiple_of(2) {
@@ -188,11 +186,11 @@ fn badly_damaged_files_are_read_or_refused() {
                 bytes.truncate(r.next() as usize % bytes.len());
             }
 
-            let Ok(version) = tinyexr::parse_exr_version_from_memory(&bytes) else {
+            let Ok(version) = tinyexr::parse_version(&bytes) else {
                 refused += 1;
                 continue;
             };
-            let Ok(mut header) = tinyexr::parse_exr_header_from_memory(&version, &bytes) else {
+            let Ok(mut header) = tinyexr::parse_header(&version, &bytes) else {
                 refused += 1;
                 continue;
             };
@@ -202,16 +200,16 @@ fn badly_damaged_files_are_read_or_refused() {
             }
             // (Tinyexr's way and the format's, by turns.)
             let loaded = if r.next().is_multiple_of(2) {
-                tinyexr::load_exr_image_from_memory(&mut header, &bytes)
+                tinyexr::load_image(&mut header, &bytes)
             } else {
-                tinyexr::load_exr_image_from_memory_as_tinyexr(&mut header, &bytes)
+                tinyexr::load_image_as_tinyexr(&mut header, &bytes)
             };
             match loaded {
                 Ok(_) => read += 1,
                 Err(_) => refused += 1,
             }
-            let _ = tinyexr::load_exr_from_memory(&bytes);
-            let _ = tinyexr::load_exr_from_memory_as_tinyexr(&bytes);
+            let _ = tinyexr::load_rgba(&bytes);
+            let _ = tinyexr::load_rgba_as_tinyexr(&bytes);
         }
     }
     assert!(read > 0 && refused > 0);
