@@ -85,7 +85,7 @@ pub(crate) fn unpredict_and_reorder(dst: &mut [u8], tmp_buf: &mut [u8]) {
 /// not smaller.
 pub(crate) fn compress_zip(src: &[u8]) -> Vec<u8> {
     let tmp_buf = reorder_and_predict(src);
-    let compressed = miniz::compress(&tmp_buf, -1);
+    let compressed = miniz::compress(&tmp_buf, miniz::Level::DEFAULT);
 
     // Use uncompressed data when compressed data is larger than uncompressed.
     // (Issue 40)
@@ -104,9 +104,9 @@ pub(crate) fn decompress_zip(dst: &mut [u8], uncompressed_size: &mut usize, src:
         dst[..src.len()].copy_from_slice(src);
         return true;
     }
-    let mut tmp_buf = match miniz::uncompress(src, *uncompressed_size) {
-        Some(tmp_buf) => tmp_buf,
-        None => return false,
+    let mut tmp_buf = match miniz::decompress(src, *uncompressed_size) {
+        Ok(tmp_buf) => tmp_buf,
+        Err(_) => return false,
     };
     *uncompressed_size = tmp_buf.len();
     unpredict_and_reorder(dst, &mut tmp_buf);

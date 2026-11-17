@@ -46,9 +46,9 @@ pub(crate) fn decompress_pxr24(
         // Data is not compressed.
         pxr24_buf = input.to_vec();
     } else {
-        match miniz::uncompress(input, pxr24_size) {
-            Some(buf) => pxr24_buf = buf,
-            None => return false,
+        match miniz::decompress(input, pxr24_size) {
+            Ok(buf) => pxr24_buf = buf,
+            Err(_) => return false,
         }
     }
 
@@ -251,5 +251,5 @@ pub(crate) fn compress_pxr24(
     }
 
     // Compress with zlib.
-    miniz::compress(&pxr24_buf, -1)
+    miniz::compress(&pxr24_buf, miniz::Level::DEFAULT)
 }

@@ -30,7 +30,7 @@ use super::{
     ExrError, PIXELTYPE_FLOAT, PIXELTYPE_HALF, PIXELTYPE_UINT, half_to_float, read_attribute,
     read_channel_info,
 };
-use miniz_nrp::tinfl::{self, TinflError};
+use miniz_nrp::{DecompressError, Format};
 
 /// `DeepImage`: the samples of a deep image, line by line.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -568,15 +568,16 @@ fn decompress_zip_from(
     let src = memory.read_up_to(at, src_len)?;
     // (No more can come out of the stream than this, so no more need be made room for.)
     let room = dst_len.min(most_from(src.len())) as usize;
-    match tinfl::tinfl_decompress(&src, room, tinfl::TINFL_FLAG_PARSE_ZLIB_HEADER) {
-        Ok((mut tmp_buf, _)) => {
+    match miniz_nrp::decompress_with(&src, Format::Zlib, room) {
+        Ok(result) => {
+            let mut tmp_buf = result.data;
             let mut dst = vec![0u8; tmp_buf.len()];
             unpredict_and_reorder(&mut dst, &mut tmp_buf);
             Ok(Some(dst))
         }
         // (A stream that runs on past what there is of it goes on past the end of the file. One
         // that fails before then fails there.)
-        Err(TinflError::CannotMakeProgress) if (src.len() as u64) < src_len => Err(Stop::Outside),
+        Err(DecompressError::Truncated) if (src.len() as u64) < src_len => Err(Stop::Outside),
         Err(_) => Ok(None),
     }
 }
@@ -945,7 +946,7 @@ mod tests {
             let packed_samples = if y == 0 {
                 samples.clone()
             } else {
-                miniz::compress(&predict(&samples), 6)
+                miniz::compress(&predict(&samples), miniz::Level::new(6).unwrap())
             };
             file.extend_from_slice(&i32::from(y).to_le_bytes());
             file.extend_from_slice(&(packed_table.len() as i64).to_le_bytes());
