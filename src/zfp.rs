@@ -40,6 +40,7 @@ pub enum ZfpSettings {
 
 impl ZfpSettings {
     /// The attributes, to go in a header's `custom_attributes`.
+    #[must_use]
     pub fn attributes(&self) -> Vec<Attribute> {
         let attribute = |name: &str, type_name: &str, value: Vec<u8>| Attribute {
             name: name.to_string(),
@@ -95,69 +96,58 @@ impl Default for ZfpParam {
     }
 }
 
-/// `FindZFPCompressionParam`: the settings in `attributes`, or none, with why in `err`.
+/// `FindZFPCompressionParam`: the settings in `attributes`, or why there are none.
 ///
 /// (As in the original, the precision of `zfpCompressionPrecision` is put where the rate goes,
 /// and so a precision is always that of 64 planes: as many as a float has.)
 pub(crate) fn find_zfp_compression_param(
     attributes: &[Attribute],
-    err: &mut String,
-) -> Option<ZfpParam> {
-    let mut param = ZfpParam::default();
-    let mut found_type = false;
-
-    for attribute in attributes {
-        if attribute.name == "zfpCompressionType" {
-            if attribute.value.len() == 1 {
-                param.kind = i32::from(attribute.value[0]);
-                found_type = true;
-                break;
-            } else {
-                err.push_str("zfpCompressionType attribute must be uchar(1 byte) type.\n");
-                return None;
-            }
-        }
-    }
-
-    if !found_type {
-        err.push_str("`zfpCompressionType` attribute not found.\n");
-        return None;
-    }
-
-    let value_of = |name: &str, size: usize| {
-        attributes
-            .iter()
-            .find(|attribute| attribute.name == name && attribute.value.len() == size)
-            .map(|attribute| attribute.value.as_slice())
+) -> Result<ZfpParam, &'static str> {
+    let Some(kind) = attributes
+        .iter()
+        .find(|attribute| attribute.name == "zfpCompressionType")
+    else {
+        return Err("`zfpCompressionType` attribute not found.\n");
     };
-    if param.kind == ZFP_COMPRESSIONTYPE_RATE {
-        if let Some(value) = value_of("zfpCompressionRate", 8) {
-            param.rate = f64::from_le_bytes(value.try_into().expect("eight bytes"));
-            return Some(param);
+    let [kind] = kind.value[..] else {
+        return Err("zfpCompressionType attribute must be uchar(1 byte) type.\n");
+    };
+    let mut param = ZfpParam {
+        kind: i32::from(kind),
+        ..ZfpParam::default()
+    };
+    match param.kind {
+        ZFP_COMPRESSIONTYPE_RATE => {
+            let value = value_of(attributes, "zfpCompressionRate")
+                .ok_or("`zfpCompressionRate` attribute not found.\n")?;
+            param.rate = f64::from_le_bytes(value);
         }
-        err.push_str("`zfpCompressionRate` attribute not found.\n");
-    } else if param.kind == ZFP_COMPRESSIONTYPE_PRECISION {
-        if let Some(value) = value_of("zfpCompressionPrecision", 4) {
-            param.rate = f64::from(i32::from_le_bytes(value.try_into().expect("four bytes")));
-            return Some(param);
+        ZFP_COMPRESSIONTYPE_PRECISION => {
+            let value = value_of(attributes, "zfpCompressionPrecision")
+                .ok_or("`zfpCompressionPrecision` attribute not found.\n")?;
+            param.rate = f64::from(i32::from_le_bytes(value));
         }
-        err.push_str("`zfpCompressionPrecision` attribute not found.\n");
-    } else if param.kind == ZFP_COMPRESSIONTYPE_ACCURACY {
-        if let Some(value) = value_of("zfpCompressionTolerance", 8) {
-            param.tolerance = f64::from_le_bytes(value.try_into().expect("eight bytes"));
-            return Some(param);
+        ZFP_COMPRESSIONTYPE_ACCURACY => {
+            let value = value_of(attributes, "zfpCompressionTolerance")
+                .ok_or("`zfpCompressionTolerance` attribute not found.\n")?;
+            param.tolerance = f64::from_le_bytes(value);
         }
-        err.push_str("`zfpCompressionTolerance` attribute not found.\n");
-    } else {
-        err.push_str("Unknown value specified for `zfpCompressionType`.\n");
+        _ => return Err("Unknown value specified for `zfpCompressionType`.\n"),
     }
+    Ok(param)
+}
 
-    None
+/// The value of the first attribute named `name` that is `N` bytes long.
+fn value_of<const N: usize>(attributes: &[Attribute], name: &str) -> Option<[u8; N]> {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.name == name)
+        .find_map(|attribute| attribute.value[..].try_into().ok())
 }
 
 /// The settings tinyexr writes with where the header has none of its own (or not all of them).
 pub(crate) fn zfp_param_for_writing(attributes: &[Attribute]) -> ZfpParam {
-    find_zfp_compression_param(attributes, &mut String::new()).unwrap_or_default()
+    find_zfp_compression_param(attributes).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------------------

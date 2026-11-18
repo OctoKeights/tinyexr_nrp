@@ -98,7 +98,7 @@ fn badly_damaged_parts_and_deep_files_are_read_or_refused() {
                 if bytes.is_empty() {
                     continue;
                 }
-                for _ in 0..1 + r.next() % 4 {
+                for _ in 0..=(r.next() % 4) {
                     let within = if r.next().is_multiple_of(2) {
                         bytes.len().min(500)
                     } else {
@@ -125,7 +125,7 @@ fn badly_damaged_parts_and_deep_files_are_read_or_refused() {
                     refused += 1;
                     continue;
                 };
-                let Ok(mut headers) = tinyexr::parse_multipart_headers(&version, &bytes) else {
+                let Ok(mut headers) = tinyexr::parse_multipart_headers(version, &bytes) else {
                     refused += 1;
                     continue;
                 };
@@ -169,7 +169,7 @@ fn badly_damaged_files_are_read_or_refused() {
             }
             // A few bytes randomised, more often near the start, where the header and the table
             // of offsets are; now and then the end cut off.
-            for _ in 0..1 + r.next() % 4 {
+            for _ in 0..=(r.next() % 4) {
                 let within = if r.next().is_multiple_of(2) {
                     bytes.len().min(500)
                 } else {
@@ -190,7 +190,7 @@ fn badly_damaged_files_are_read_or_refused() {
                 refused += 1;
                 continue;
             };
-            let Ok(mut header) = tinyexr::parse_header(&version, &bytes) else {
+            let Ok(mut header) = tinyexr::parse_header(version, &bytes) else {
                 refused += 1;
                 continue;
             };

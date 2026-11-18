@@ -22,8 +22,8 @@ fn channel(c: usize) -> ChannelData {
     let values = (0..(WIDTH * HEIGHT) as usize)
         .map(|i| {
             state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let noise = (state >> 60) as u16;
             let (x, y) = (i % WIDTH as usize, i / WIDTH as usize);
             if c == 0 {
@@ -60,7 +60,7 @@ fn main() {
         ..ExrImage::default()
     };
     let raw = (WIDTH * HEIGHT * 4 * 2) as usize;
-    let mpixels = (WIDTH * HEIGHT) as f64 / 1e6;
+    let mpixels = f64::from(WIDTH * HEIGHT) / 1e6;
     for (name, compression_type) in [
         ("none", Compression::NONE),
         ("rle", Compression::RLE),
@@ -102,7 +102,7 @@ fn main() {
         });
         let load = best(runs, || {
             let version = parse_version(&file).unwrap();
-            let mut header = parse_header(&version, &file).unwrap();
+            let mut header = parse_header(version, &file).unwrap();
             std::hint::black_box(load_image(&mut header, &file).unwrap());
         });
         println!(

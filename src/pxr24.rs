@@ -70,10 +70,10 @@ pub(crate) fn decompress_pxr24(
 
                 let mut pixel = 0u32;
                 for x in 0..w {
-                    let diff = ((pxr24_buf[ptr0 + x] as u32) << 24)
-                        | ((pxr24_buf[ptr1 + x] as u32) << 16)
-                        | ((pxr24_buf[ptr2 + x] as u32) << 8)
-                        | pxr24_buf[ptr3 + x] as u32;
+                    let diff = (u32::from(pxr24_buf[ptr0 + x]) << 24)
+                        | (u32::from(pxr24_buf[ptr1 + x]) << 16)
+                        | (u32::from(pxr24_buf[ptr2 + x]) << 8)
+                        | u32::from(pxr24_buf[ptr3 + x]);
                     pixel = pixel.wrapping_add(diff);
                     out[out_p..out_p + 4].copy_from_slice(&pixel.to_le_bytes());
                     out_p += 4;
@@ -85,7 +85,8 @@ pub(crate) fn decompress_pxr24(
 
                 let mut pixel = 0u32;
                 for x in 0..w {
-                    let diff = ((pxr24_buf[ptr0 + x] as u32) << 8) | pxr24_buf[ptr1 + x] as u32;
+                    let diff =
+                        (u32::from(pxr24_buf[ptr0 + x]) << 8) | u32::from(pxr24_buf[ptr1 + x]);
                     pixel = pixel.wrapping_add(diff);
                     out[out_p..out_p + 2].copy_from_slice(&(pixel as u16).to_le_bytes());
                     out_p += 2;
@@ -97,9 +98,9 @@ pub(crate) fn decompress_pxr24(
 
                 let mut pixel = 0u32;
                 for x in 0..w {
-                    let diff = ((pxr24_buf[ptr0 + x] as u32) << 24)
-                        | ((pxr24_buf[ptr1 + x] as u32) << 16)
-                        | ((pxr24_buf[ptr2 + x] as u32) << 8);
+                    let diff = (u32::from(pxr24_buf[ptr0 + x]) << 24)
+                        | (u32::from(pxr24_buf[ptr1 + x]) << 16)
+                        | (u32::from(pxr24_buf[ptr2 + x]) << 8);
                     pixel = pixel.wrapping_add(diff);
                     // Float24 to float32: the 24-bit value is in the upper 24 bits.
                     out[out_p..out_p + 4].copy_from_slice(&pixel.to_le_bytes());
@@ -114,16 +115,18 @@ pub(crate) fn decompress_pxr24(
 
 /// `float_to_float24`: a float as the 24 bits PXR24 keeps of it, rounded to nearest; an
 /// infinity stays one and a NaN stays one.
+// (The names are tinyexr's, so that the code reads against the original.)
+#[allow(clippy::many_single_char_names)]
 #[inline]
 fn float_to_float24(f: f32) -> u32 {
     let i = f.to_bits();
     // Disassemble the 32-bit floating point number, f, into sign, s, exponent, e, and
     // significand, m.
-    let s = i & 0x80000000;
-    let e = i & 0x7f800000;
-    let mut m = i & 0x007fffff;
+    let s = i & 0x8000_0000;
+    let e = i & 0x7f80_0000;
+    let mut m = i & 0x007f_ffff;
 
-    if e == 0x7f800000 {
+    if e == 0x7f80_0000 {
         if m != 0 {
             // F is a NAN; we preserve the sign bit and the 15 leftmost bits of the
             // significand, with one exception: if the 15 leftmost bits are all zero, the NAN
@@ -131,16 +134,15 @@ fn float_to_float24(f: f32) -> u32 {
             // significand.
             m >>= 8;
             return (s >> 8) | (e >> 8) | m | u32::from(m == 0);
-        } else {
-            // F is an infinity.
-            return (s >> 8) | (e >> 8);
         }
+        // F is an infinity.
+        return (s >> 8) | (e >> 8);
     }
 
     // F is finite, round the significand to 15 bits.
-    let mut i = ((e | m) + (m & 0x00000080)) >> 8;
+    let mut i = ((e | m) + (m & 0x0000_0080)) >> 8;
 
-    if i >= 0x7f8000 {
+    if i >= 0x007f_8000 {
         // F was close to FLT_MAX, and the significand was rounded up, resulting in an
         // exponent overflow. Avoid the overflow by truncating the significand instead of
         // rounding it.

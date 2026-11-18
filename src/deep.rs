@@ -147,6 +147,10 @@ impl<'a> Memory<'a> {
 }
 
 /// `LoadDeepEXR`, of a file in memory: its deep image.
+///
+/// # Errors
+///
+/// A file that is not a deep image, or that is damaged, with tinyexr's error code and message.
 pub fn load_deep(memory: &[u8]) -> Result<DeepImage, ExrError> {
     let zeros = Memory {
         bytes: memory,
@@ -197,6 +201,8 @@ fn same(a: &DeepImage, b: &DeepImage) -> bool {
 }
 
 /// `LoadDeepEXR` itself.
+// (One pass, step for step as tinyexr's, its state shared throughout.)
+#[allow(clippy::too_many_lines)]
 fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     let file_size = memory.bytes.len();
     if file_size == 0 {
@@ -471,9 +477,8 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         let mut channel_offset = 0i32;
         for channel in &channels {
             channel_offset += match channel.pixel_type {
-                PixelType::UINT => 4,
+                PixelType::UINT | PixelType::FLOAT => 4,
                 PixelType::HALF => 2,
-                PixelType::FLOAT => 4,
                 _ => {
                     return Err(error(
                         ErrorCode::INVALID_DATA,
@@ -487,7 +492,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
             return Err(error(ErrorCode::INVALID_DATA, ""));
         }
 
-        if pixel_offset_table[width - 1].wrapping_mul(sample_size) as i64 as u64
+        if i64::from(pixel_offset_table[width - 1].wrapping_mul(sample_size)) as u64
             != sample_data.len() as u64
         {
             return Err(error(ErrorCode::INVALID_DATA, ""));
@@ -606,17 +611,15 @@ fn decompress_deep(compression_type: Compression, dst: &mut [u8], src: &[u8]) ->
     if compression_type == Compression::RLE {
         return decompress_rle(dst, dst.len(), src);
     }
-    let mut ul = dst.len();
-    if !decompress_zip(dst, &mut ul, src) {
-        return false;
-    }
-    ul == dst.len()
+    decompress_zip(dst, src) == Some(dst.len())
 }
 
 /// `DecodeDeepTiled`: a single-level deep *tiled* part into the scanline-organized
-/// `DeepImage` (offset_table[y][x] = cumulative count within row y; image[c][y] = that row's
+/// `DeepImage` (`offset_table`[y][x] = cumulative count within row y; image[c][y] = that row's
 /// samples concatenated in x order). `marker` is where the tile offset table is.
-#[allow(clippy::too_many_arguments)]
+// (Its parameters are tinyexr's, each a separate part of the state; one pass, step for step as
+// tinyexr's, its state shared throughout.)
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn decode_deep_tiled(
     memory: &Memory,
     channels: &[ChannelInfo],
@@ -629,6 +632,21 @@ fn decode_deep_tiled(
     tile_level_mode: TileLevelMode,
     mut marker: i64,
 ) -> Result<DeepImage, Stop> {
+    // A tile's place, its part of the image, and its block's sizes, as the original reads
+    // them.
+    struct Tile {
+        offset: u64,
+        x0: usize,
+        y0: usize,
+        tw: usize,
+        th: usize,
+        pots: i64,
+        psds: i64,
+        usds: i64,
+    }
+    // A tile's place and level, and the sizes of its offset table and of its samples (packed
+    // and unpacked).
+    type TileHeader = (i32, i32, i32, i32, i64, i64, i64);
     let file_size = memory.bytes.len() as u64;
     if tile_size_x <= 0 || tile_size_y <= 0 {
         return Err(error(
@@ -676,8 +694,9 @@ fn decode_deep_tiled(
         sample_size += ps;
     }
 
-    let num_x_tiles = (data_width as i64 + tile_size_x as i64 - 1) / tile_size_x as i64;
-    let num_y_tiles = (data_height as i64 + tile_size_y as i64 - 1) / tile_size_y as i64;
+    let num_x_tiles = (i64::from(data_width) + i64::from(tile_size_x) - 1) / i64::from(tile_size_x);
+    let num_y_tiles =
+        (i64::from(data_height) + i64::from(tile_size_y) - 1) / i64::from(tile_size_y);
     let num_tiles = num_x_tiles as u64 * num_y_tiles as u64;
     let (num_x_tiles, num_y_tiles) = (num_x_tiles as i32, num_y_tiles as i32);
 
@@ -699,21 +718,6 @@ fn decode_deep_tiled(
     }
     let mut counts = vec![0i32; width * height];
 
-    // A tile's place, its part of the image, and its block's sizes, as the original reads
-    // them.
-    struct Tile {
-        offset: u64,
-        x0: usize,
-        y0: usize,
-        tw: usize,
-        th: usize,
-        pots: i64,
-        psds: i64,
-        usds: i64,
-    }
-    // A tile's place and level, and the sizes of its offset table and of its samples (packed
-    // and unpacked).
-    type TileHeader = (i32, i32, i32, i32, i64, i64, i64);
     let tile_at = |offset: u64| -> Result<TileHeader, Stop> {
         let p = offset as i64;
         Ok((
@@ -843,10 +847,10 @@ fn decode_deep_tiled(
         for ry in 0..th {
             for rx in 0..tw {
                 tile_total =
-                    tile_total.wrapping_add(counts[(y0 + ry) * width + x0 + rx] as i64 as u64);
+                    tile_total.wrapping_add(i64::from(counts[(y0 + ry) * width + x0 + rx]) as u64);
             }
         }
-        if usds != (tile_total as i64).wrapping_mul(sample_size as i64) {
+        if usds != (tile_total as i64).wrapping_mul(i64::from(sample_size)) {
             return Err(error(
                 ErrorCode::INVALID_DATA,
                 "Deep tile sample size mismatch",

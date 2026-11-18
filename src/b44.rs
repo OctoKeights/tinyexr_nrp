@@ -10,10 +10,12 @@ use std::sync::OnceLock;
 use super::{ChannelInfo, PixelType};
 
 /// `B44HalfToFloat`.
+// (The names are tinyexr's, so that the code reads against the original.)
+#[allow(clippy::many_single_char_names)]
 fn b44_half_to_float(h: u16) -> f32 {
-    let s = ((h >> 15) & 0x1) as u32;
-    let e = ((h >> 10) & 0x1f) as u32;
-    let m = (h & 0x3ff) as u32;
+    let s = u32::from((h >> 15) & 0x1);
+    let e = u32::from((h >> 10) & 0x1f);
+    let m = u32::from(h & 0x3ff);
 
     if e == 0 {
         if m == 0 {
@@ -24,18 +26,20 @@ fn b44_half_to_float(h: u16) -> f32 {
         f *= 1.0 / 16384.0;
         return if s != 0 { -f } else { f };
     } else if e == 31 {
-        return f32::from_bits((s << 31) | 0x7f800000 | (m << 13));
+        return f32::from_bits((s << 31) | 0x7f80_0000 | (m << 13));
     }
 
     f32::from_bits((s << 31) | ((e + 112) << 23) | (m << 13))
 }
 
 /// `B44FloatToHalf`.
+// (The names are tinyexr's, so that the code reads against the original.)
+#[allow(clippy::many_single_char_names)]
 fn b44_float_to_half(f: f32) -> u16 {
     let i = f.to_bits();
     let s = ((i >> 31) & 0x1) as i32;
     let e = ((i >> 23) & 0xff) as i32;
-    let mut m = (i & 0x7fffff) as i32;
+    let mut m = (i & 0x007f_ffff) as i32;
 
     if e == 0 {
         return (s << 15) as u16;
@@ -45,7 +49,7 @@ fn b44_float_to_half(f: f32) -> u16 {
         if e < 103 {
             return (s << 15) as u16;
         }
-        m = (m | 0x800000) >> (114 - e);
+        m = (m | 0x0080_0000) >> (114 - e);
         return ((s << 15) | (m >> 13)) as u16;
     } else if e > 142 {
         return ((s << 15) | 0x7c00) as u16;
@@ -77,7 +81,7 @@ pub(crate) fn b44_tables() -> &'static B44Tables {
                 exp_table[i] = 0x7bff;
             } else {
                 let mut f = b44_half_to_float(x);
-                f = (f as f64 / 8.0).exp() as f32;
+                f = (f64::from(f) / 8.0).exp() as f32;
                 exp_table[i] = b44_float_to_half(f);
             }
 
@@ -89,7 +93,7 @@ pub(crate) fn b44_tables() -> &'static B44Tables {
                 if f <= 0.0 {
                     log_table[i] = 0;
                 } else {
-                    f = (8.0 * (f as f64).ln()) as f32;
+                    f = (8.0 * f64::from(f).ln()) as f32;
                     log_table[i] = b44_float_to_half(f);
                 }
             }
@@ -103,14 +107,14 @@ pub(crate) fn b44_tables() -> &'static B44Tables {
 
 /// `UnpackB44Block`: sixteen halves out of fourteen bytes.
 fn unpack_b44_block(dst: &mut [u16; 16], src: &[u8]) {
-    let s = |i: usize| src[i] as u32;
+    let s = |i: usize| u32::from(src[i]);
     let s0 = ((s(0) << 8) | s(1)) as u16;
 
     let shift = s(2) >> 2;
-    let bias = (0x20u32 << shift) as u16 as u32;
+    let bias = u32::from((0x20u32 << shift) as u16);
     // A value from the one it leans on and a difference of six bits.
     let step = |from: u16, six_bits: u32| {
-        (from as u32)
+        u32::from(from)
             .wrapping_add((six_bits & 0x3f).wrapping_mul(1u32 << shift))
             .wrapping_sub(bias) as u16
     };
@@ -150,7 +154,7 @@ fn unpack_b44_block(dst: &mut [u16; 16], src: &[u8]) {
 
 /// `UnpackB44FlatBlock`: sixteen halves, all the same, out of three bytes.
 fn unpack_b44_flat_block(dst: &mut [u16; 16], src: &[u8]) {
-    let t = ((src[0] as u16) << 8) | src[1] as u16;
+    let t = (u16::from(src[0]) << 8) | u16::from(src[1]);
     let h = if t & 0x8000 != 0 { t & 0x7fff } else { !t };
     *dst = [h; 16];
 }
@@ -162,6 +166,8 @@ fn sampling(value: i32) -> i32 {
 
 /// `DecompressB44`: a block of `num_lines` lines of `data_width` pixels into `out`, channel
 /// after channel.
+// (One pass, step for step as tinyexr's, its state shared throughout.)
+#[allow(clippy::too_many_lines)]
 pub(crate) fn decompress_b44(
     out: &mut [u8],
     input: &[u8],
@@ -261,7 +267,7 @@ pub(crate) fn decompress_b44(
 
                 // Apply pLinear conversion if needed.
                 if channel.p_linear != 0 {
-                    for value in block.iter_mut() {
+                    for value in &mut block {
                         *value = tables.log_table[*value as usize];
                     }
                 }
@@ -326,13 +332,13 @@ fn b44_shift_and_round(mut x: i32, mut shift: i32) -> i32 {
 /// `PackB44Block`: sixteen halves, a block of four by four, into 14 bytes of `out`, or into
 /// 3 when they are all the same and `flatfields` allows it. The answer is how many.
 fn pack_b44_block(out: &mut [u8], block: &[u16; 16], flatfields: bool, exactmax: bool) -> usize {
+    const BIAS: i32 = 0x20;
     let mut d = [0i32; 16];
     let mut r = [0i32; 15];
     let mut r_min;
     let mut r_max;
     let mut t = [0u16; 16];
     let mut shift = -1i32;
-    const BIAS: i32 = 0x20;
 
     // Convert to ordered representation: handle NaN/Inf, then convert signed magnitude to
     // an ordered unsigned.

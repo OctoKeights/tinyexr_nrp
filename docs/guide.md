@@ -39,7 +39,7 @@ use tinyexr_nrp::{ChannelData, PixelType, load_image, parse_header, parse_versio
 let file = save_floats(&[0.5; 16 * 16 * 3], 16, 16, 3, true).unwrap();
 
 let version = parse_version(&file).unwrap();
-let mut header = parse_header(&version, &file).unwrap();
+let mut header = parse_header(version, &file).unwrap();
 assert_eq!(header.channels[0].name, "B"); // A file sorts its channels by name.
 assert_eq!(header.channels[0].pixel_type, PixelType::HALF);
 
@@ -99,7 +99,7 @@ another type than `pixel_types` says, is refused.
 
 ## Tiles and levels
 
-A tiled image (`tiled` set to 1, with `tile_size_x`, `tile_size_y` and a `TileLevelMode`)
+A tiled image (`tiled` set, with `tile_size_x`, `tile_size_y` and a `TileLevelMode`)
 holds its pixels in `ExrImage::tiles`, and its further mip or rip levels in `next_level`.
 `tile_levels` gives the levels a header implies, in the order a file stores them and
 `save_image` expects them, with each level's size and its number of tiles across and down.
@@ -111,7 +111,7 @@ use tinyexr_nrp::{Box2i, ExrHeader, TileLevelMode, tile_levels};
 
 let header = ExrHeader {
     data_window: Box2i { min_x: 0, min_y: 0, max_x: 99, max_y: 49 },
-    tiled: 1,
+    tiled: true,
     tile_size_x: 32,
     tile_size_y: 32,
     tile_level_mode: TileLevelMode::MIPMAP_LEVELS,

@@ -75,7 +75,10 @@ fn write_channel_info(channels: &[ChannelInfo], file_types: &[PixelType]) -> Vec
 /// `EncodePixelData`: `num_lines` lines of `width` pixels from the line `line_no` on, taken
 /// from `images` (whose lines are `x_stride` values apart), as a block of a file, added to
 /// `out_data`. Each channel is stored as its type in `file_types`.
-#[allow(clippy::too_many_arguments)]
+/// On failure, the reason the original gives (empty where it gives none).
+// (Its parameters are tinyexr's, each a separate part of the state; one pass, step for step as
+// tinyexr's, its state shared throughout.)
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn encode_pixel_data(
     out_data: &mut Vec<u8>,
     images: &[ChannelData],
@@ -89,9 +92,8 @@ fn encode_pixel_data(
     channel_offset_list: &[usize],
     zfp: &ZfpParam,
     dwa: &DwaParam,
-    err: &mut String,
     as_tinyexr: bool,
-) -> bool {
+) -> Result<(), &'static str> {
     let width_size = width as usize;
     let buf_size = width_size * num_lines as usize * pixel_data_size;
     let mut buf = vec![0u8; buf_size];
@@ -103,8 +105,7 @@ fn encode_pixel_data(
             && file_type != PixelType::HALF
             && file_type != PixelType::FLOAT
         {
-            err.push_str("Invalid requested_pixel_type.\n");
-            return false;
+            return Err("Invalid requested_pixel_type.\n");
         }
         for y in 0..num_lines as usize {
             // Assume increasing Y.
@@ -163,8 +164,7 @@ fn encode_pixel_data(
     } else if compression_type == Compression::RLE {
         // (buf.size() * 3) / 2 would be enough.
         let Some(block) = compress_rle(&buf) else {
-            err.push_str("RLE compresssion failed.\n");
-            return false;
+            return Err("RLE compresssion failed.\n");
         };
         out_data.extend_from_slice(&block);
     } else if compression_type == Compression::PIZ {
@@ -179,7 +179,7 @@ fn encode_pixel_data(
         // ~     : pixel data(compressed)
         // (`check` has refused what the original would not compress.)
         let Ok(block) = compress_zfp(&buf, width, num_lines, file_types.len(), zfp) else {
-            return false;
+            return Err("");
         };
         out_data.extend_from_slice(&block);
     } else if compression_type == Compression::PXR24 {
@@ -245,10 +245,10 @@ fn encode_pixel_data(
             .expect("a block of the channels' size"),
         );
     } else {
-        return false;
+        return Err("");
     }
 
-    true
+    Ok(())
 }
 
 /// What a block of DWAA or DWAB needs of the header: the channels' names, the level, and
@@ -298,6 +298,7 @@ fn dwa_level(attributes: &[Attribute]) -> f32 {
 /// for a header's `custom_attributes`: OpenEXR's "base error" times 100000, from 0 to
 /// 6550400000. With 0 nothing is lost to the quantization (but some to the rest); OpenEXR's
 /// default is 45.
+#[must_use]
 pub fn dwa_compression_level_attribute(level: f32) -> Attribute {
     Attribute {
         name: "dwaCompressionLevel".to_string(),
@@ -311,6 +312,7 @@ pub const DWA_INVALID_LEVEL: &str = "Invalid dwa quality level specified";
 
 /// `EncodeTiledLevel`: the tiles of one level, each as a block in `data_list` from
 /// `start_index` on.
+// (Its parameters are tinyexr's, each a separate part of the state.)
 #[allow(clippy::too_many_arguments)]
 fn encode_tiled_level(
     level_image: &ExrImage,
@@ -323,23 +325,28 @@ fn encode_tiled_level(
     pixel_data_size: usize,
     zfp: &ZfpParam,
     dwa: &DwaParam,
-    err: &mut String,
     as_tinyexr: bool,
-) -> ErrorCode {
+) -> Result<(), ExrError> {
     let num_tiles = num_x_tiles.wrapping_mul(num_y_tiles);
-    if num_tiles as i64 != level_image.tiles.len() as i64 {
-        err.push_str("Invalid number of tiles in argument.\n");
-        return ErrorCode::INVALID_ARGUMENT;
+    if i64::from(num_tiles) != level_image.tiles.len() as i64 {
+        return Err(ExrError::new(
+            ErrorCode::INVALID_ARGUMENT,
+            "Invalid number of tiles in argument.\n",
+        ));
     }
 
     if (exr_header.tile_size_x > level_image.width || exr_header.tile_size_y > level_image.height)
         && level_image.level_x == 0
         && level_image.level_y == 0
     {
-        err.push_str("Failed to encode tile data.\n");
-        return ErrorCode::INVALID_DATA;
+        return Err(ExrError::new(
+            ErrorCode::INVALID_DATA,
+            "Failed to encode tile data.\n",
+        ));
     }
 
+    // (The reasons each failing tile gives, in turn.)
+    let mut failures = String::new();
     let mut invalid_data = false;
     for i in 0..num_tiles {
         let tile_idx = i as usize;
@@ -368,10 +375,10 @@ fn encode_tiled_level(
             channel_offset_list,
             zfp,
             dwa,
-            err,
             as_tinyexr,
         );
-        if !ret {
+        if let Err(reason) = ret {
+            failures.push_str(reason);
             invalid_data = true;
             continue;
         }
@@ -391,15 +398,17 @@ fn encode_tiled_level(
     }
 
     if invalid_data {
-        err.push_str("Failed to encode tile data.\n");
-        return ErrorCode::INVALID_DATA;
+        failures.push_str("Failed to encode tile data.\n");
+        return Err(ExrError::new(ErrorCode::INVALID_DATA, failures));
     }
-    ErrorCode::SUCCESS
+    Ok(())
 }
 
 /// `EncodeChunk`: every block of the image, in `data_list`, and where each will be in the
-/// file, in `offset_data`. `total_size` comes back as the size of the file.
-#[allow(clippy::too_many_arguments)]
+/// file, in `offset_data`; with them, the size of the file.
+// (Its parameters are tinyexr's, each a separate part of the state; one pass, step for step as
+// tinyexr's, its state shared throughout.)
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn encode_chunk(
     exr_image: &ExrImage,
     exr_header: &ExrHeader,
@@ -408,10 +417,8 @@ fn encode_chunk(
     is_multipart: bool,
     offset_data: &mut OffsetData,
     data_list: &mut Vec<Vec<u8>>,
-    total_size: &mut u64,
-    err: &mut String,
     as_tinyexr: bool,
-) -> ErrorCode {
+) -> Result<u64, ExrError> {
     let num_scanlines = num_scanline_blocks(exr_header.compression_type, as_tinyexr);
 
     data_list.clear();
@@ -431,8 +438,10 @@ fn encode_chunk(
                 pixel_data_size += 4;
                 channel_offset += 4;
             } else {
-                err.push_str("Invalid requested_pixel_type.\n");
-                return ErrorCode::INVALID_DATA;
+                return Err(ExrError::new(
+                    ErrorCode::INVALID_DATA,
+                    "Invalid requested_pixel_type.\n",
+                ));
             }
         }
     }
@@ -445,86 +454,10 @@ fn encode_chunk(
     // (In a file of many parts, each block has its part's number before it.)
     let doffset = if is_multipart { 4u64 } else { 0 };
 
-    if !exr_image.tiles.is_empty() {
-        let mut level_image = Some(exr_image);
-        let mut block_idx = 0usize;
-        let num_levels = if exr_header.tile_level_mode != TileLevelMode::RIPMAP_LEVELS {
-            offset_data.num_x_levels
-        } else {
-            offset_data
-                .num_x_levels
-                .wrapping_mul(offset_data.num_y_levels)
-        };
-        for level in 0..num_levels {
-            let Some(image) = level_image else {
-                err.push_str("Invalid number of tiled levels for EncodeChunk\n");
-                return ErrorCode::INVALID_DATA;
-            };
-
-            let level_index_from_image = level_index(
-                image.level_x,
-                image.level_y,
-                exr_header.tile_level_mode,
-                offset_data.num_x_levels,
-            );
-            if level_index_from_image < 0 {
-                err.push_str("Invalid tile level mode\n");
-                return ErrorCode::INVALID_DATA;
-            }
-
-            if level_index_from_image != level {
-                err.push_str("Incorrect level ordering in tiled image\n");
-                return ErrorCode::INVALID_DATA;
-            }
-            let num_y_tiles = offset_data.offsets[level as usize].len() as i32;
-            if num_y_tiles <= 0 {
-                err.push_str("Invalid Y tile size\n");
-                return ErrorCode::INVALID_DATA;
-            }
-
-            let num_x_tiles = offset_data.offsets[level as usize][0].len() as i32;
-            if num_x_tiles <= 0 {
-                err.push_str("Invalid X tile size\n");
-                return ErrorCode::INVALID_DATA;
-            }
-
-            let mut e = String::new();
-            let ret = encode_tiled_level(
-                image,
-                exr_header,
-                data_list,
-                block_idx,
-                num_x_tiles,
-                num_y_tiles,
-                &channel_offset_list,
-                pixel_data_size,
-                &zfp,
-                &dwa,
-                &mut e,
-                as_tinyexr,
-            );
-            if ret != ErrorCode::SUCCESS {
-                if !e.is_empty() {
-                    err.push_str(&e);
-                }
-                return ret;
-            }
-
-            for row in &mut offset_data.offsets[level as usize][..num_y_tiles as usize] {
-                for slot in &mut row[..num_x_tiles as usize] {
-                    *slot = offset;
-                    offset += data_list[block_idx].len() as u64 + doffset;
-                    block_idx += 1;
-                }
-            }
-            level_image = image.next_level.as_deref();
-        }
-        if block_idx as i64 != num_blocks as i64 {
-            return ErrorCode::INVALID_DATA;
-        }
-        *total_size = offset;
-    } else {
+    if exr_image.tiles.is_empty() {
         // scanlines
+        // (The reasons each failing block gives, in turn.)
+        let mut failures = String::new();
         let mut invalid_data = false;
 
         for i in 0..num_blocks {
@@ -550,10 +483,10 @@ fn encode_chunk(
                 &channel_offset_list,
                 &zfp,
                 &dwa,
-                err,
                 as_tinyexr,
             );
-            if !ret {
+            if let Err(reason) = ret {
+                failures.push_str(reason);
                 invalid_data = true;
                 continue;
             }
@@ -568,8 +501,8 @@ fn encode_chunk(
         }
 
         if invalid_data {
-            err.push_str("Failed to encode scanline data.\n");
-            return ErrorCode::INVALID_DATA;
+            failures.push_str("Failed to encode scanline data.\n");
+            return Err(ExrError::new(ErrorCode::INVALID_DATA, failures));
         }
 
         let offsets = &mut offset_data.offsets[0][0];
@@ -578,13 +511,94 @@ fn encode_chunk(
             offset += data.len() as u64 + doffset;
         }
 
-        *total_size = offset;
+        Ok(offset)
+    } else {
+        let mut level_image = Some(exr_image);
+        let mut block_idx = 0usize;
+        let num_levels = if exr_header.tile_level_mode == TileLevelMode::RIPMAP_LEVELS {
+            offset_data
+                .num_x_levels
+                .wrapping_mul(offset_data.num_y_levels)
+        } else {
+            offset_data.num_x_levels
+        };
+        for level in 0..num_levels {
+            let Some(image) = level_image else {
+                return Err(ExrError::new(
+                    ErrorCode::INVALID_DATA,
+                    "Invalid number of tiled levels for EncodeChunk\n",
+                ));
+            };
+
+            let level_index_from_image = level_index(
+                image.level_x,
+                image.level_y,
+                exr_header.tile_level_mode,
+                offset_data.num_x_levels,
+            );
+            if level_index_from_image < 0 {
+                return Err(ExrError::new(
+                    ErrorCode::INVALID_DATA,
+                    "Invalid tile level mode\n",
+                ));
+            }
+
+            if level_index_from_image != level {
+                return Err(ExrError::new(
+                    ErrorCode::INVALID_DATA,
+                    "Incorrect level ordering in tiled image\n",
+                ));
+            }
+            let num_y_tiles = offset_data.offsets[level as usize].len() as i32;
+            if num_y_tiles <= 0 {
+                return Err(ExrError::new(
+                    ErrorCode::INVALID_DATA,
+                    "Invalid Y tile size\n",
+                ));
+            }
+
+            let num_x_tiles = offset_data.offsets[level as usize][0].len() as i32;
+            if num_x_tiles <= 0 {
+                return Err(ExrError::new(
+                    ErrorCode::INVALID_DATA,
+                    "Invalid X tile size\n",
+                ));
+            }
+
+            encode_tiled_level(
+                image,
+                exr_header,
+                data_list,
+                block_idx,
+                num_x_tiles,
+                num_y_tiles,
+                &channel_offset_list,
+                pixel_data_size,
+                &zfp,
+                &dwa,
+                as_tinyexr,
+            )?;
+
+            for row in &mut offset_data.offsets[level as usize][..num_y_tiles as usize] {
+                for slot in &mut row[..num_x_tiles as usize] {
+                    *slot = offset;
+                    offset += data_list[block_idx].len() as u64 + doffset;
+                    block_idx += 1;
+                }
+            }
+            level_image = image.next_level.as_deref();
+        }
+        if block_idx as i64 != i64::from(num_blocks) {
+            return Err(ErrorCode::INVALID_DATA.into());
+        }
+        Ok(offset)
     }
-    ErrorCode::SUCCESS
 }
 
 /// What the original would read past its memory for, or throw on, in what it is handed.
 /// (It is handed pointers and trusts the header for what is behind them.)
+// (One pass, step for step as tinyexr's, its state shared throughout.)
+#[allow(clippy::too_many_lines)]
 fn check(exr_image: &ExrImage, exr_header: &ExrHeader, as_tinyexr: bool) -> Result<(), ExrError> {
     let refuse = |message: &str| {
         Err(ExrError {
@@ -598,7 +612,7 @@ fn check(exr_image: &ExrImage, exr_header: &ExrHeader, as_tinyexr: bool) -> Resu
             || exr_header.compression_type == Compression::DWAB)
     {
         let level = dwa_level(&exr_header.custom_attributes);
-        if !(0.0..=65504.0 * 100000.0).contains(&level) {
+        if !(0.0..=65504.0 * 100_000.0).contains(&level) {
             return refuse(DWA_INVALID_LEVEL);
         }
     }
@@ -735,6 +749,10 @@ pub const ZFP_TOO_LARGE: &str =
 /// [`save_image_as_tinyexr`] writes them as tinyexr does.
 ///
 /// [`tile_levels`]: super::tile_levels
+///
+/// # Errors
+///
+/// A header or image tinyexr would refuse to write, with tinyexr's error code and message.
 pub fn save_image(exr_image: &ExrImage, exr_header: &ExrHeader) -> Result<Vec<u8>, ExrError> {
     save_image_with(exr_image, exr_header, false)
 }
@@ -747,6 +765,10 @@ pub fn save_image(exr_image: &ExrImage, exr_header: &ExrHeader) -> Result<Vec<u8
 /// tinyexr does.)
 ///
 /// [`load_image_as_tinyexr`]: super::load_image_as_tinyexr
+///
+/// # Errors
+///
+/// As [`save_image`].
 pub fn save_image_as_tinyexr(
     exr_image: &ExrImage,
     exr_header: &ExrHeader,
@@ -766,12 +788,21 @@ fn save_image_with(
 /// header, as [`save_image`] writes one. Each part needs a `name`, and no two
 /// the same; the size of the first part is every part's display window. With one part the
 /// file is the one [`save_image`] writes.
+///
+/// # Errors
+///
+/// No parts, a part without a name of its own, or a part [`save_image`] would refuse, with
+/// tinyexr's error code and message.
 pub fn save_multipart_images(parts: &[(&ExrImage, &ExrHeader)]) -> Result<Vec<u8>, ExrError> {
     save_multipart(parts, false)
 }
 
 /// `SaveEXRMultipartImageToMemory` exactly as tinyexr has it
 /// ([`save_image_as_tinyexr`] says where that differs).
+///
+/// # Errors
+///
+/// As [`save_multipart_images`].
 pub fn save_multipart_images_as_tinyexr(
     parts: &[(&ExrImage, &ExrHeader)],
 ) -> Result<Vec<u8>, ExrError> {
@@ -792,6 +823,8 @@ fn save_multipart(
 }
 
 /// `SaveEXRNPartImageToMemory`.
+// (One pass, step for step as tinyexr's, its state shared throughout.)
+#[allow(clippy::too_many_lines)]
 fn save_parts(parts: &[(&ExrImage, &ExrHeader)], as_tinyexr: bool) -> Result<Vec<u8>, ExrError> {
     let fail = |code: ErrorCode, message: &str| {
         Err(ExrError {
@@ -845,7 +878,7 @@ fn save_parts(parts: &[(&ExrImage, &ExrHeader)], as_tinyexr: bool) -> Result<Vec
             marker[1] |= 0x2;
         }
         // long_name
-        if long_name != 0 {
+        if long_name {
             marker[1] |= 0x4;
         }
         // multipart
@@ -969,30 +1002,29 @@ fn save_parts(parts: &[(&ExrImage, &ExrHeader)], as_tinyexr: bool) -> Result<Vec
                     .position(|&byte| byte == 0)
                     .unwrap_or(name.len())
                     .min(255)];
-                if !name.is_empty() {
-                    if !partnames.iter().any(|seen| seen == name) {
-                        partnames.push(name.to_vec());
-                    }
-                    if partnames.len() != i + 1 {
-                        return fail(
-                            ErrorCode::SERIALIZATION_FAILED,
-                            "'name' attributes must be unique for a multi-part file",
-                        );
-                    }
-                    write_attribute_bytes(&mut memory, b"name", b"string", name);
-                } else {
+                if name.is_empty() {
                     return fail(
                         ErrorCode::SERIALIZATION_FAILED,
                         "Invalid 'name' attribute for a multi-part file",
                     );
                 }
+                if !partnames.iter().any(|seen| seen == name) {
+                    partnames.push(name.to_vec());
+                }
+                if partnames.len() != i + 1 {
+                    return fail(
+                        ErrorCode::SERIALIZATION_FAILED,
+                        "'name' attributes must be unique for a multi-part file",
+                    );
+                }
+                write_attribute_bytes(&mut memory, b"name", b"string", name);
             }
             // type
             {
-                let type_name = if !exr_image.tiles.is_empty() {
-                    "tiledimage"
-                } else {
+                let type_name = if exr_image.tiles.is_empty() {
                     "scanlineimage"
+                } else {
+                    "tiledimage"
                 };
                 write_attribute_to_memory(&mut memory, "type", "string", type_name.as_bytes());
             }
@@ -1023,13 +1055,12 @@ fn save_parts(parts: &[(&ExrImage, &ExrHeader)], as_tinyexr: bool) -> Result<Vec
         memory.push(0);
     }
 
-    let mut chunk_offset = memory.len() as u64 + total_chunk_count as i64 as u64 * 8;
+    let mut chunk_offset = memory.len() as u64 + i64::from(total_chunk_count) as u64 * 8;
 
     let mut total_size = 0u64;
     let mut data_lists: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_parts];
     for (i, &(exr_image, exr_header)) in parts.iter().enumerate() {
-        let mut e = String::new();
-        let ret = encode_chunk(
+        total_size = encode_chunk(
             exr_image,
             exr_header,
             chunk_count[i],
@@ -1037,16 +1068,9 @@ fn save_parts(parts: &[(&ExrImage, &ExrHeader)], as_tinyexr: bool) -> Result<Vec
             num_parts > 1,
             &mut offset_data[i],
             &mut data_lists[i],
-            &mut total_size,
-            &mut e,
             as_tinyexr,
-        );
-        if ret != ErrorCode::SUCCESS {
-            return Err(ExrError {
-                code: ErrorCode::SERIALIZATION_FAILED,
-                message: e,
-            });
-        }
+        )
+        .map_err(|error| ExrError::new(ErrorCode::SERIALIZATION_FAILED, error.message))?;
         chunk_offset = total_size;
     }
 
@@ -1083,6 +1107,11 @@ fn save_parts(parts: &[(&ExrImage, &ExrHeader)], as_tinyexr: bool) -> Result<Vec
 /// as the original names it), three (red, green and blue) or four (and alpha). They are
 /// stored as halves if `save_as_fp16`, as floats if not; compressed with ZIP, or not at all
 /// when the image is less than sixteen pixels each way.
+///
+/// # Errors
+///
+/// An unsupported number of components, or fewer floats than the size asks for, with tinyexr's
+/// error code and message.
 pub fn save_floats(
     data: &[f32],
     width: i32,

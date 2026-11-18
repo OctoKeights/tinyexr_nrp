@@ -13,6 +13,8 @@
 
 /// The two programs make the same blocks from the same seed: a 64-bit linear congruential
 /// generator, the high half of its state.
+use std::fmt::Write;
+
 pub struct Random {
     pub state: u64,
 }
@@ -21,8 +23,8 @@ impl Random {
     pub fn next(&mut self) -> u32 {
         self.state = self
             .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (self.state >> 32) as u32
     }
 }
@@ -35,14 +37,14 @@ pub struct Hash {
 impl Hash {
     pub fn new() -> Hash {
         Hash {
-            value: 14695981039346656037,
+            value: 14_695_981_039_346_656_037,
         }
     }
 
     pub fn add(&mut self, data: &[u8]) {
         for &byte in data {
             self.value ^= u64::from(byte);
-            self.value = self.value.wrapping_mul(1099511628211);
+            self.value = self.value.wrapping_mul(1_099_511_628_211);
         }
     }
 }
@@ -61,10 +63,10 @@ pub fn tinyexr_left(header: &tinyexr_nrp::ExrHeader) -> bool {
         || h <= 0
         || w > limit
         || h > limit
-        || (header.tiled != 0 && (tile_x > limit || tile_y > limit));
+        || (header.tiled && (tile_x > limit || tile_y > limit));
     if refused {
         false
-    } else if header.tiled != 0 {
+    } else if header.tiled {
         w * h > (1 << 22)
             || tile_x <= 0
             || tile_y <= 0
@@ -79,19 +81,9 @@ pub fn tinyexr_left(header: &tinyexr_nrp::ExrHeader) -> bool {
 /// to a file (for each: whether halves are to be read as floats, and the file), each read as
 /// that program reads it with tinyexr: its version, its header, its image, and it as floats
 /// of red, green, blue and alpha.
+// (Written step for step as the C side, `compare/dump_tinyexr.cc`, has it.)
+#[allow(clippy::too_many_lines)]
 pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
-    use tinyexr_nrp::{self as tinyexr, ChannelData, ExrError, ExrImage};
-    let mut hash = Hash::new();
-    let (mut headers, mut images, mut refused, mut left, mut as_rgba, mut stopped) =
-        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
-    let mut file_total = 0u64;
-    let mut out = String::new();
-    let mut at = 0;
-    let number = |at: &mut usize| {
-        let value = u32::from_le_bytes(file[*at..*at + 4].try_into().unwrap()) as usize;
-        *at += 4;
-        value
-    };
     fn add_number(hash: &mut Hash, value: impl Into<i32>) {
         let value: i32 = value.into();
         hash.add(&value.to_le_bytes());
@@ -99,7 +91,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
     // A name with its end, or a mark in its place where it was not UTF-8.
     fn add_name(hash: &mut Hash, text: &str) {
         if text.contains('\u{fffd}') {
-            hash.add(&0xfffffffdu32.to_le_bytes());
+            hash.add(&0xffff_fffd_u32.to_le_bytes());
         } else {
             hash.add(text.as_bytes());
             hash.add(&[0]);
@@ -107,7 +99,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
     }
     fn add_message(hash: &mut Hash, message: &str) {
         if message.is_empty() {
-            hash.add(&0xfffffffeu32.to_le_bytes());
+            hash.add(&0xffff_fffe_u32.to_le_bytes());
         } else {
             hash.add(message.as_bytes());
             hash.add(&[0]);
@@ -134,7 +126,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
     fn continue_with_rgba(hash: &mut Hash, wish: usize, bytes: &[u8], as_rgba: &mut u32) {
         let loaded = tinyexr::load_rgba_as_tinyexr(bytes);
         if wish & 8 != 0 {
-            hash.add(&0xfffffffcu32.to_le_bytes());
+            hash.add(&0xffff_fffc_u32.to_le_bytes());
             if loaded.is_ok() {
                 hash.add(b"read where tinyexr stops");
             }
@@ -158,6 +150,18 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
             }
         }
     }
+    use tinyexr_nrp::{self as tinyexr, ChannelData, ExrError, ExrImage};
+    let mut hash = Hash::new();
+    let (mut headers, mut images, mut refused, mut left, mut as_rgba, mut stopped) =
+        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut file_total = 0u64;
+    let mut out = String::new();
+    let mut at = 0;
+    let number = |at: &mut usize| {
+        let value = u32::from_le_bytes(file[*at..*at + 4].try_into().unwrap()) as usize;
+        *at += 4;
+        value
+    };
     for i in 0..count {
         let wish = number(&mut at);
         let size = number(&mut at);
@@ -179,7 +183,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
                 add_number(&mut hash, i32::from(version.non_image));
                 add_number(&mut hash, i32::from(version.multipart));
 
-                match tinyexr::parse_header_as_tinyexr(&version, bytes) {
+                match tinyexr::parse_header_as_tinyexr(version, bytes) {
                     Err(error) => add_error(&mut hash, &error),
                     Ok(mut header) => {
                         add_number(&mut hash, 0);
@@ -197,14 +201,14 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
                         hash.add(&header.screen_window_center[1].to_bits().to_le_bytes());
                         hash.add(&header.screen_window_width.to_bits().to_le_bytes());
                         add_number(&mut hash, header.chunk_count);
-                        add_number(&mut hash, header.tiled);
+                        add_number(&mut hash, i32::from(header.tiled));
                         add_number(&mut hash, header.tile_size_x);
                         add_number(&mut hash, header.tile_size_y);
                         add_number(&mut hash, header.tile_level_mode);
                         add_number(&mut hash, header.tile_rounding_mode);
-                        add_number(&mut hash, header.long_name);
-                        add_number(&mut hash, header.non_image);
-                        add_number(&mut hash, header.multipart);
+                        add_number(&mut hash, i32::from(header.long_name));
+                        add_number(&mut hash, i32::from(header.non_image));
+                        add_number(&mut hash, i32::from(header.multipart));
                         add_number(&mut hash, header.header_len as i32);
                         add_number(&mut hash, header.custom_attributes.len() as i32);
                         for attribute in &header.custom_attributes {
@@ -248,7 +252,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
                                 // Where tinyexr stops (it throws, and nothing catches it),
                                 // the port has to refuse the file.
                                 (true, loaded) => {
-                                    hash.add(&0xfffffffcu32.to_le_bytes());
+                                    hash.add(&0xffff_fffc_u32.to_le_bytes());
                                     stopped += 1;
                                     if loaded.is_ok() {
                                         hash.add(b"read where tinyexr stops");
@@ -273,7 +277,11 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
                                         add_number(&mut hash, level.height);
                                         add_number(&mut hash, level.num_channels);
                                         add_number(&mut hash, level.tiles.len() as i32);
-                                        if !level.tiles.is_empty() {
+                                        if level.tiles.is_empty() {
+                                            for values in &level.images {
+                                                add_values(&mut hash, values);
+                                            }
+                                        } else {
                                             for tile in &level.tiles {
                                                 add_number(&mut hash, tile.offset_x);
                                                 add_number(&mut hash, tile.offset_y);
@@ -284,10 +292,6 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
                                                 for values in &tile.images {
                                                     add_values(&mut hash, values);
                                                 }
-                                            }
-                                        } else {
-                                            for values in &level.images {
-                                                add_values(&mut hash, values);
                                             }
                                         }
                                         next = level.next_level.as_deref();
@@ -305,7 +309,7 @@ pub fn tinyexr_read(name: &str, count: u32, file: &[u8]) -> String {
         }
 
         if (i + 1) % 200 == 0 || i + 1 == count {
-            out += &format!("{name} {} {:016x}\n", i + 1, hash.value);
+            writeln!(out, "{name} {} {:016x}", i + 1, hash.value).unwrap();
         }
     }
     out + &format!(
@@ -347,7 +351,7 @@ fn exr_values(
                 _ => {
                     let n = r.next();
                     if pixel_type == PixelType::FLOAT {
-                        0x3c000000 + n % 0x04000000
+                        0x3c00_0000 + n % 0x0400_0000
                     } else if pixel_type == PixelType::HALF {
                         0x3000 + n % 0x1000
                     } else {
@@ -398,6 +402,8 @@ fn exr_zfp_double(r: &mut Random, tolerance: bool, many: bool) -> f64 {
 
 /// A synthetic image (`MakeImage`); for ZFP compression (`g_zfp`), of floats, most of them of
 /// whole blocks of four by four, with the attributes of ZFP's settings.
+// (Written step for step as the C side, `compare/dump_tinyexr.cc`, has it.)
+#[allow(clippy::too_many_lines)]
 fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
     use tinyexr_nrp::{
         self as tinyexr, Attribute, Box2i, ChannelInfo, ExrHeader, ExrImage, ExrTile,
@@ -521,7 +527,7 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
         // written, at 2 bits a value, and not read.)
         plain = false;
     }
-    header.long_name = i32::from(r.next().is_multiple_of(8));
+    header.long_name = r.next().is_multiple_of(8);
     if zfp {
         // The settings: a rate, a precision or a tolerance, each with its type; now and then
         // a type it does not know, none, a type of other than one byte, or no value for it.
@@ -690,7 +696,7 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
         };
     }
 
-    header.tiled = 1;
+    header.tiled = true;
     header.tile_size_x = 1 + (r.next() % width.min(64) as u32) as i32;
     header.tile_size_y = 1 + (r.next() % height.min(64) as u32) as i32;
     if zfp && !r.next().is_multiple_of(8) {
@@ -769,14 +775,9 @@ fn exr_image(r: &mut Random, small: bool, zfp: bool) -> ExrMade {
 /// with tinyexr: a hash of each file's bytes, or of the message where none is saved. Each
 /// file is read back besides, which the other program does not do: what was saved as it was
 /// has to come back as it was.
+// (Written step for step as the C side, `compare/dump_tinyexr.cc`, has it.)
+#[allow(clippy::too_many_lines)]
 pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
-    use tinyexr_nrp::{self as tinyexr, ChannelData};
-    let mut r = Random { state: seed };
-    let mut hash = Hash::new();
-    let small = name.ends_with("_small");
-    let mut file_total = 0u64;
-    let (mut saved, mut not_saved, mut short_way) = (0u32, 0u32, 0u32);
-    let mut out = String::new();
     // The values of a channel as bits, to compare them.
     fn bits(values: &ChannelData, index: usize) -> u32 {
         match values {
@@ -785,6 +786,13 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
             ChannelData::Float(values) => values[index].to_bits(),
         }
     }
+    use tinyexr_nrp::{self as tinyexr, ChannelData};
+    let mut r = Random { state: seed };
+    let mut hash = Hash::new();
+    let small = name.ends_with("_small");
+    let mut file_total = 0u64;
+    let (mut saved, mut not_saved, mut short_way) = (0u32, 0u32, 0u32);
+    let mut out = String::new();
     for i in 0..count {
         let made = exr_image(&mut r, small, name.starts_with("tinyexr_zfp"));
         match tinyexr::save_image_as_tinyexr(&made.image, &made.header) {
@@ -826,7 +834,7 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
                         panic!("{name}: file {i} is not read back: {code:?}")
                     });
                     let mut header =
-                        tinyexr::parse_header(&version, &file).unwrap_or_else(|error| {
+                        tinyexr::parse_header(version, &file).unwrap_or_else(|error| {
                             panic!("{name}: file {i} is not read back: {error:?}")
                         });
                     let read = tinyexr::load_image(&mut header, &file).unwrap_or_else(|error| {
@@ -951,7 +959,7 @@ pub fn tinyexr_write(name: &str, seed: u64, count: u32) -> String {
         }
 
         if (i + 1) % 200 == 0 || i + 1 == count {
-            out += &format!("{name} {} {:016x}\n", i + 1, hash.value);
+            writeln!(out, "{name} {} {:016x}", i + 1, hash.value).unwrap();
         }
     }
     out + &format!(
@@ -968,7 +976,7 @@ fn exr_add_number(hash: &mut Hash, value: impl Into<i32>) {
 /// A name with its end, or a mark in its place where it was not UTF-8 (`AddName`).
 fn exr_add_name(hash: &mut Hash, text: &str) {
     if text.contains('\u{fffd}') {
-        hash.add(&0xfffffffdu32.to_le_bytes());
+        hash.add(&0xffff_fffd_u32.to_le_bytes());
     } else {
         hash.add(text.as_bytes());
         hash.add(&[0]);
@@ -979,7 +987,7 @@ fn exr_add_name(hash: &mut Hash, text: &str) {
 fn exr_add_error(hash: &mut Hash, code: impl Into<i32>, message: &str) {
     exr_add_number(hash, code);
     if message.is_empty() {
-        hash.add(&0xfffffffeu32.to_le_bytes());
+        hash.add(&0xffff_fffe_u32.to_le_bytes());
     } else {
         hash.add(message.as_bytes());
         hash.add(&[0]);
@@ -1000,14 +1008,14 @@ fn exr_add_header(hash: &mut Hash, header: &tinyexr_nrp::ExrHeader) {
     hash.add(&header.screen_window_center[1].to_bits().to_le_bytes());
     hash.add(&header.screen_window_width.to_bits().to_le_bytes());
     exr_add_number(hash, header.chunk_count);
-    exr_add_number(hash, header.tiled);
+    exr_add_number(hash, i32::from(header.tiled));
     exr_add_number(hash, header.tile_size_x);
     exr_add_number(hash, header.tile_size_y);
     exr_add_number(hash, header.tile_level_mode);
     exr_add_number(hash, header.tile_rounding_mode);
-    exr_add_number(hash, header.long_name);
-    exr_add_number(hash, header.non_image);
-    exr_add_number(hash, header.multipart);
+    exr_add_number(hash, i32::from(header.long_name));
+    exr_add_number(hash, i32::from(header.non_image));
+    exr_add_number(hash, i32::from(header.multipart));
     exr_add_number(hash, header.header_len as i32);
     exr_add_number(hash, header.custom_attributes.len() as i32);
     for attribute in &header.custom_attributes {
@@ -1057,7 +1065,11 @@ fn exr_add_image(hash: &mut Hash, image: &tinyexr_nrp::ExrImage, header: &tinyex
         exr_add_number(hash, level.height);
         exr_add_number(hash, level.num_channels);
         exr_add_number(hash, level.tiles.len() as i32);
-        if !level.tiles.is_empty() {
+        if level.tiles.is_empty() {
+            for values in &level.images {
+                add_values(hash, values);
+            }
+        } else {
             for tile in &level.tiles {
                 exr_add_number(hash, tile.offset_x);
                 exr_add_number(hash, tile.offset_y);
@@ -1068,10 +1080,6 @@ fn exr_add_image(hash: &mut Hash, image: &tinyexr_nrp::ExrImage, header: &tinyex
                 for values in &tile.images {
                     add_values(hash, values);
                 }
-            }
-        } else {
-            for values in &level.images {
-                add_values(hash, values);
             }
         }
         next = level.next_level.as_deref();
@@ -1123,7 +1131,7 @@ fn exr_read_parts(hash: &mut Hash, bytes: &[u8], wish: u32) -> ExrEnd {
     exr_add_number(hash, i32::from(version.long_name));
     exr_add_number(hash, i32::from(version.non_image));
     exr_add_number(hash, i32::from(version.multipart));
-    let mut headers = match tinyexr::parse_multipart_headers_as_tinyexr(&version, bytes) {
+    let mut headers = match tinyexr::parse_multipart_headers_as_tinyexr(version, bytes) {
         Err(error) if error.message == PAST_THE_END => return ExrEnd::PastTheEnd,
         Err(error) => {
             exr_add_error(hash, error.code, &error.message);
@@ -1141,7 +1149,7 @@ fn exr_read_parts(hash: &mut Hash, bytes: &[u8], wish: u32) -> ExrEnd {
         chunks += i64::from(header.chunk_count.max(0));
     }
     if left || chunks > 1 << 16 {
-        hash.add(&0xfffffffbu32.to_le_bytes());
+        hash.add(&0xffff_fffb_u32.to_le_bytes());
         return ExrEnd::Read;
     }
     for (i, header) in headers.iter_mut().enumerate() {
@@ -1207,7 +1215,7 @@ pub fn tinyexr_parts(name: &str, seed: u64, count: u32, file: &[u8]) -> String {
             names.push(part_name);
         }
         for (made, part_name) in parts.iter_mut().zip(&names) {
-            made.header.name = part_name.clone();
+            made.header.name.clone_from(part_name);
         }
         let list: Vec<_> = parts
             .iter()
@@ -1248,7 +1256,7 @@ pub fn tinyexr_parts(name: &str, seed: u64, count: u32, file: &[u8]) -> String {
             eprintln!("file {i} {:016x}", hash.value);
         }
         if (i + 1) % 200 == 0 || i + 1 == count {
-            out += &format!("{name} {} {:016x}\n", i + 1, hash.value);
+            writeln!(out, "{name} {} {:016x}", i + 1, hash.value).unwrap();
         }
     }
     out + &format!(
@@ -1330,7 +1338,7 @@ pub fn tinyexr_deep(name: &str, count: u32, file: &[u8]) -> String {
             eprintln!("file {i} {:016x}", hash.value);
         }
         if (i + 1) % 200 == 0 || i + 1 == count {
-            out += &format!("{name} {} {:016x}\n", i + 1, hash.value);
+            writeln!(out, "{name} {} {:016x}", i + 1, hash.value).unwrap();
         }
     }
     out + &format!(

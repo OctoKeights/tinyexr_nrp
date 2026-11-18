@@ -7,7 +7,7 @@ use super::piz::decompress_piz;
 use super::pxr24::decompress_pxr24;
 use super::zfp::{ZfpParam, decompress_zfp};
 use super::zip_rle::{decompress_rle, decompress_zip};
-use super::{ChannelInfo, Compression, PixelType, half_to_float};
+use super::{ChannelInfo, Compression, LineOrder, PixelType, half_to_float};
 use openexr_nrp::{PixelType as DwaPixelType, dwa};
 
 /// The values of one channel of an image or of a tile, line after line. (The original has a
@@ -102,14 +102,14 @@ fn zeros<T: Clone + Default>(len: usize) -> Option<Vec<T>> {
 /// end.)
 #[inline]
 fn image_index(
-    line_order: i32,
+    line_order: LineOrder,
     height: i32,
     line_no: i32,
     x_stride: i32,
     v: usize,
     u: usize,
 ) -> usize {
-    let line = if line_order == 0 {
+    let line = if line_order == LineOrder::INCREASING_Y {
         (line_no as isize as usize).wrapping_add(v)
     } else {
         (height as isize as usize)
@@ -203,12 +203,13 @@ fn put_fours(image: &mut ChannelData, start: usize, src: &[u8]) -> bool {
 /// What the PIZ, ZIP, RLE and PXR24 blocks of the original each end with: the lines of a
 /// decompressed block, in which each line holds its channels one after the other, into the
 /// channels of the image.
+// (Its parameters are tinyexr's, each a separate part of the state.)
 #[allow(clippy::too_many_arguments)]
 fn unpack_lines(
     out_images: &mut [ChannelData],
     requested_pixel_types: &[PixelType],
     out_buf: &[u8],
-    line_order: i32,
+    line_order: LineOrder,
     width: i32,
     height: i32,
     x_stride: i32,
@@ -266,14 +267,16 @@ fn block_size(width: i32, num_lines: i32, pixel_data_size: usize) -> Option<usiz
 /// `width` pixels, from the line `line_no` (or `y`, for a block that is not compressed) of
 /// an image of `height` lines whose lines are `x_stride` values apart. `zfp` is what the
 /// header's attributes say of ZFP compression, for a block of it.
-#[allow(clippy::too_many_arguments)]
+// (Its parameters are tinyexr's, each a separate part of the state; one pass, step for step as
+// tinyexr's, its state shared throughout.)
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn decode_pixel_data(
     out_images: &mut [ChannelData],
     requested_pixel_types: &[PixelType],
     data: &[u8],
     data_len: usize,
     compression_type: Compression,
-    line_order: i32,
+    line_order: LineOrder,
     width: i32,
     height: i32,
     x_stride: i32,
@@ -352,12 +355,7 @@ pub(crate) fn decode_pixel_data(
         };
         let mut out_buf = vec![0u8; size];
 
-        let mut dst_len = size;
-        if dst_len == 0 {
-            return false;
-        }
-
-        if !decompress_zip(&mut out_buf, &mut dst_len, block) {
+        if size == 0 || decompress_zip(&mut out_buf, block).is_none() {
             return false;
         }
 
@@ -730,13 +728,12 @@ pub(crate) fn decode_pixel_data(
     }
 }
 
-/// `DecodeTiledPixelData`: a tile's block into the tile's channels. The answer has the
-/// tile's width and height, which are less than the tile size at the right and bottom edges.
+/// `DecodeTiledPixelData`: a tile's block into the tile's channels. The answer is the tile's
+/// width and height, which are less than the tile size at the right and bottom edges.
+// (Its parameters are tinyexr's, each a separate part of the state.)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_tiled_pixel_data(
     out_images: &mut [ChannelData],
-    width: &mut i32,
-    height: &mut i32,
     requested_pixel_types: &[PixelType],
     data: &[u8],
     data_len: usize,
@@ -752,26 +749,25 @@ pub(crate) fn decode_tiled_pixel_data(
     channel_offset_list: &[usize],
     zfp: Option<&ZfpParam>,
     as_tinyexr: bool,
-) -> bool {
+) -> Option<(i32, i32)> {
     // Here, data_width and data_height are the dimensions of the current (sub)level.
     if tile_size_x.wrapping_mul(tile_offset_x) > data_width
         || tile_size_y.wrapping_mul(tile_offset_y) > data_height
     {
-        return false;
+        return None;
     }
 
     // Compute actual image size in a tile.
-    if tile_offset_x.wrapping_add(1).wrapping_mul(tile_size_x) >= data_width {
-        *width = data_width.wrapping_sub(tile_offset_x.wrapping_mul(tile_size_x));
+    let width = if tile_offset_x.wrapping_add(1).wrapping_mul(tile_size_x) >= data_width {
+        data_width.wrapping_sub(tile_offset_x.wrapping_mul(tile_size_x))
     } else {
-        *width = tile_size_x;
-    }
-
-    if tile_offset_y.wrapping_add(1).wrapping_mul(tile_size_y) >= data_height {
-        *height = data_height.wrapping_sub(tile_offset_y.wrapping_mul(tile_size_y));
+        tile_size_x
+    };
+    let height = if tile_offset_y.wrapping_add(1).wrapping_mul(tile_size_y) >= data_height {
+        data_height.wrapping_sub(tile_offset_y.wrapping_mul(tile_size_y))
     } else {
-        *height = tile_size_y;
-    }
+        tile_size_y
+    };
 
     // Image size = tile size.
     decode_pixel_data(
@@ -780,17 +776,18 @@ pub(crate) fn decode_tiled_pixel_data(
         data,
         data_len,
         compression_type,
-        /* line_order */ 0,
-        *width,
+        LineOrder::INCREASING_Y,
+        width,
         tile_size_y,
         /* stride */ tile_size_x,
         /* y */ 0,
         /* line_no */ 0,
-        *height,
+        height,
         pixel_data_size,
         channels,
         channel_offset_list,
         zfp,
         as_tinyexr,
     )
+    .then_some((width, height))
 }

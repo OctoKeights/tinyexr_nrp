@@ -37,10 +37,10 @@ fn reorder_and_predict(src: &[u8]) -> Vec<u8> {
 
     // Predictor.
     if src_size > 0 {
-        let mut p = tmp_buf[0] as i32;
+        let mut p = i32::from(tmp_buf[0]);
         for byte in &mut tmp_buf[1..] {
-            let d = *byte as i32 - p + (128 + 256);
-            p = *byte as i32;
+            let d = i32::from(*byte) - p + (128 + 256);
+            p = i32::from(*byte);
             *byte = d as u8;
         }
     }
@@ -53,7 +53,7 @@ pub(crate) fn unpredict_and_reorder(dst: &mut [u8], tmp_buf: &mut [u8]) {
     let size = tmp_buf.len();
     // Predictor.
     for t in 1..size {
-        let d = tmp_buf[t - 1] as i32 + tmp_buf[t] as i32 - 128;
+        let d = i32::from(tmp_buf[t - 1]) + i32::from(tmp_buf[t]) - 128;
         tmp_buf[t] = d as u8;
     }
 
@@ -95,22 +95,18 @@ pub(crate) fn compress_zip(src: &[u8]) -> Vec<u8> {
     compressed
 }
 
-/// `DecompressZip`: a block of `*uncompressed_size` bytes into `dst`. A stream that holds
-/// fewer bytes than that is taken, as the original takes it: `*uncompressed_size` then says
-/// how many, and the rest of `dst` is left as it was.
-pub(crate) fn decompress_zip(dst: &mut [u8], uncompressed_size: &mut usize, src: &[u8]) -> bool {
-    if *uncompressed_size == src.len() {
+/// `DecompressZip`: a block of as many bytes as `dst` holds into `dst`. The answer is how many
+/// it held: a stream that holds fewer is taken, as the original takes it, and the rest of
+/// `dst` is left as it was.
+pub(crate) fn decompress_zip(dst: &mut [u8], src: &[u8]) -> Option<usize> {
+    if dst.len() == src.len() {
         // Data is not compressed (Issue 40).
-        dst[..src.len()].copy_from_slice(src);
-        return true;
+        dst.copy_from_slice(src);
+        return Some(src.len());
     }
-    let mut tmp_buf = match miniz::decompress(src, *uncompressed_size) {
-        Ok(tmp_buf) => tmp_buf,
-        Err(_) => return false,
-    };
-    *uncompressed_size = tmp_buf.len();
+    let mut tmp_buf = miniz::decompress(src, dst.len()).ok()?;
     unpredict_and_reorder(dst, &mut tmp_buf);
-    true
+    Some(tmp_buf.len())
 }
 
 const MIN_RUN_LENGTH: isize = 3;
@@ -136,7 +132,7 @@ fn rle_compress(input: &[u8], out: &mut [u8]) -> usize {
 
         if run_end - run_start >= MIN_RUN_LENGTH {
             // Compressible run.
-            out[out_write] = ((run_end - run_start) as i8 as i32 - 1) as u8;
+            out[out_write] = (i32::from((run_end - run_start) as i8) - 1) as u8;
             out_write += 1;
             out[out_write] = at(run_start);
             out_write += 1;
@@ -176,7 +172,7 @@ fn rle_uncompress(input: &[u8], mut max_length: i32, out: &mut [u8]) -> i32 {
 
     while in_length > 0 {
         if (input[i] as i8) < 0 {
-            let count = -(input[i] as i8 as i32);
+            let count = -i32::from(input[i] as i8);
             i += 1;
             in_length -= count + 1;
 
@@ -191,7 +187,7 @@ fn rle_uncompress(input: &[u8], mut max_length: i32, out: &mut [u8]) -> i32 {
             o += count;
             i += count;
         } else {
-            let count = input[i] as i32;
+            let count = i32::from(input[i]);
             i += 1;
             in_length -= 2;
 
@@ -200,9 +196,10 @@ fn rle_uncompress(input: &[u8], mut max_length: i32, out: &mut [u8]) -> i32 {
                 return 0;
             }
 
-            let count = count as usize;
-            out[o..o + count + 1].fill(input[i]);
-            o += count + 1;
+            // (A run of `count + 1` copies of the byte.)
+            let run = count as usize + 1;
+            out[o..o + run].fill(input[i]);
+            o += run;
             i += 1;
         }
     }
