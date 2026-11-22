@@ -1,6 +1,5 @@
 # Proper names that clippy's doc_markdown lint would otherwise take for code to put in
 # backticks; ".." keeps clippy's own list.
 doc-valid-idents = [
-    "OpenEXR", "OpenEXRCore", "DreamWorks", "CbCr", "YCbCr", "DirectX", "GitHub", "PowerPC",
-    "MacOS", "ImageMagick", "FreeImage", "LibTIFF", "ZStandard", "KTX2", "..",
+    "OpenEXR", "OpenEXRCore", "DreamWorks", "CbCr", "YCbCr", "GitHub", "..",
 ]
