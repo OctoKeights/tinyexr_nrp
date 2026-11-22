@@ -8,12 +8,22 @@ license = "BSD-3-Clause"
 repository = "https://github.com/OctoKeights/tinyexr_nrp"
 readme = "README.md"
 keywords = ["exr", "openexr", "hdr", "image", "tinyexr"]
-categories = ["multimedia::images", "encoding"]
+categories = ["multimedia::images", "encoding", "no-std"]
+exclude = [".gitattributes", ".github/", "compare/", "clippy.toml", "rust-toolchain.toml", "tests/"]
+
+[features]
+default = ["std", "dwa", "zfp"]
+std = ["miniz_nrp/std"]
+dwa = ["dep:openexr_nrp"]
+zfp = ["dep:zfp_nrp"]
 
 [dependencies]
-miniz_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/miniz_nrp" }
-zfp_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/zfp_nrp" }
-openexr_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/openexr_nrp" }
+miniz_nrp = { version = "0.3.0", default-features = false }
+zfp_nrp = { version = "0.3.0", optional = true }
+openexr_nrp = { version = "0.3.0", optional = true }
+
+[profile.test]
+opt-level = 2
 
 [lints.rust]
 # No unsafe code in the library, its tests, examples or benchmarks.

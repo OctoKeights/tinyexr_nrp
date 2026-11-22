@@ -69,6 +69,7 @@ fn main() {
         ("piz", Compression::PIZ),
         ("pxr24", Compression::PXR24),
         ("b44", Compression::B44),
+        #[cfg(feature = "dwa")]
         ("dwaa", Compression::DWAA),
     ] {
         if only.as_deref().is_some_and(|only| only != name) {

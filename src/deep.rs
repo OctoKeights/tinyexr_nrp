@@ -1,5 +1,5 @@
 //! Deep images: a port of `LoadDeepEXR` and `DecodeDeepTiled` of tinyexr v3.4.0
-//! (`tinyexr.h`), read from memory. tinyexr reads deep images and does not write them.
+//! (`tinyexr.h`), read from memory, plus [`save_deep`] for writing deep scanline `.exr` files.
 //!
 //! What tinyexr reads, and so the port:
 //!
@@ -7,26 +7,23 @@
 //!   each block for one line, so with ZIP (sixteen lines a block) only the first of every
 //!   sixteen lines has samples, and the others none. A block it cannot decompress ends the
 //!   reading there and is not reported: the image comes back empty, with no width, height,
-//!   channels or samples (the original's answer is success, with a width and height of 0 and
-//!   the lines it had made so far, which a reader of such an image does not look at).
+//!   channels or samples.
 //! - **Deep tiles** of one level, uncompressed or compressed with RLE, ZIPS or ZIP.
-//!
-//! The original reads past the end of a damaged file, and before its start, without a look:
-//! for the table of offsets of a file of scanlines and for each of its blocks. Here what is
-//! past the end is taken to be all zeros and then all ones, as in [`super::parts`]; where the
-//! answer differs, or the read is before the file or far past its end, the file is refused
-//! with [`super::parts::PAST_THE_END`]. So is a file the original stops on (an attribute too
-//! short for what it reads of it, a size it cannot allocate).
 
-use crate::TileLevelMode;
-use std::borrow::Cow;
-use std::cell::Cell;
+use alloc::{
+    borrow::Cow,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::cell::Cell;
 
 use super::parts::PAST_THE_END;
-use super::zip_rle::{decompress_rle, decompress_zip, unpredict_and_reorder};
+use super::zip_rle::{compress_zip_into, decompress_rle, decompress_zip, unpredict_and_reorder};
 use super::{
-    ChannelInfo, Compression, ErrorCode, ExrError, PixelType, half_to_float, read_attribute,
-    read_channel_info,
+    ChannelInfo, Compression, ErrorCode, ExrError, PixelType, TileLevelMode, half_to_float,
+    read_attribute, read_channel_info,
 };
 use miniz_nrp::{DecompressError, Format};
 
@@ -35,8 +32,7 @@ use miniz_nrp::{DecompressError, Format};
 pub struct DeepImage {
     /// The name of each channel.
     pub channel_names: Vec<String>,
-    /// `image[channel][line]`: the samples of a line, every pixel's one after another. (Of a
-    /// file of scanlines, the lines that have a block of their own: see the module's notes.)
+    /// `image[channel][line]`: the samples of a line, every pixel's one after another.
     pub image: Vec<Vec<Vec<f32>>>,
     /// `offset_table[line][x]`: how many samples the line has up to and including pixel `x`.
     pub offset_table: Vec<Vec<i32>>,
@@ -49,22 +45,19 @@ pub struct DeepImage {
 }
 
 /// How far past the end of a file a read is still taken as reading what is there: 64 KiB,
-/// and on to the next multiple of 4 KiB from the start of the file. (Where the comparison
-/// with the original puts memory it cannot read.)
+/// and on to the next multiple of 4 KiB from the start of the file.
 fn reach(size: u64) -> u64 {
     (size + 65536).div_ceil(4096) * 4096
 }
 
-/// The largest number of pixels a deep image is read with: 67 million. (The original
-/// allocates a count for each, however many.)
+/// The largest number of pixels a deep image is read or written with: 67 million.
 const MAX_PIXELS: u64 = 1 << 26;
 
 /// The most bytes miniz's `mz_uncompress` takes in: past it, it fails at once.
 const MZ_LIMIT: u64 = 0xFFFF_FFFF;
 
-/// The largest block of a file of scanlines that is decompressed: 1 GiB. (The original
-/// allocates what a block says it comes to twice over before it looks at the block, and a
-/// file that has it allocate more is one it may stop on, for want of memory: it is refused.)
+/// The largest block of a file of scanlines (or total deep tile sample memory) that is
+/// decompressed: 1 GiB.
 const MAX_BLOCK: u64 = 1 << 30;
 
 /// The bytes of the file as the original reads them, with `pad` past its end.
@@ -94,7 +87,6 @@ fn error(code: ErrorCode, message: &str) -> Stop {
 }
 
 impl<'a> Memory<'a> {
-    /// `len` bytes from `at`: past the end, the pad.
     fn read(&self, at: i64, len: u64) -> Result<Cow<'a, [u8]>, Stop> {
         let size = self.bytes.len() as u64;
         if at < 0 {
@@ -122,8 +114,6 @@ impl<'a> Memory<'a> {
         ))
     }
 
-    /// Up to `len` bytes from `at`, as many as there are up to [`reach`]: for a
-    /// decompressor, which reads only as far as its stream goes.
     fn read_up_to(&self, at: i64, len: u64) -> Result<Cow<'a, [u8]>, Stop> {
         let size = self.bytes.len() as u64;
         if at < 0 || at as u64 > reach(size) {
@@ -186,6 +176,229 @@ pub fn load_deep(memory: &[u8]) -> Result<DeepImage, ExrError> {
     }
 }
 
+/// Writes `deep_image` as an OpenEXR 2.0 `deepscanline` (ZIPS-compressed, `FLOAT` channels)
+/// `.exr` file in memory that round-trips through [`load_deep`].
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::INVALID_ARGUMENT`] if dimensions, channel names, cumulative
+/// `offset_table` rows, or `image` sample counts are missing or inconsistent, or
+/// [`ErrorCode::DATA_TOO_LARGE`] if the image exceeds [`load_deep`]'s size bounds.
+#[allow(clippy::too_many_lines)]
+pub fn save_deep(deep_image: &DeepImage) -> Result<Vec<u8>, ExrError> {
+    let bad = |message: &str| {
+        Err(ExrError {
+            code: ErrorCode::INVALID_ARGUMENT,
+            message: message.to_string(),
+        })
+    };
+    if deep_image.width < 1 || deep_image.height < 1 {
+        return bad("A deep image needs a positive width and height.");
+    }
+    if deep_image.num_channels < 1 {
+        return bad("A deep image needs at least one channel.");
+    }
+    let width = deep_image.width as usize;
+    let height = deep_image.height as usize;
+    let num_channels = deep_image.num_channels as usize;
+    if (width as u64).saturating_mul(height as u64) > MAX_PIXELS {
+        return Err(ExrError::new(
+            ErrorCode::DATA_TOO_LARGE,
+            "Deep image pixel count exceeds maximum.",
+        ));
+    }
+    if deep_image.channel_names.len() != num_channels || deep_image.image.len() != num_channels {
+        return bad("channel_names and image must match num_channels.");
+    }
+    if deep_image.offset_table.len() != height {
+        return bad("offset_table must have one row per scanline.");
+    }
+
+    let mut clean_names: Vec<Vec<u8>> = Vec::with_capacity(num_channels);
+    for raw_name in &deep_image.channel_names {
+        let bytes = raw_name.as_bytes();
+        let end = bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(bytes.len())
+            .min(255);
+        let slice = &bytes[..end];
+        if slice.is_empty() {
+            return bad("Deep channel names must not be empty.");
+        }
+        if clean_names.iter().any(|seen| seen.as_slice() == slice) {
+            return bad("Deep channel names must be unique.");
+        }
+        clean_names.push(slice.to_vec());
+    }
+
+    let mut max_samples_per_pixel = 0i32;
+    let mut line_totals = Vec::with_capacity(height);
+    for (y, row) in deep_image.offset_table.iter().enumerate() {
+        if row.len() != width {
+            return bad("Each offset_table row must have `width` cumulative sample counts.");
+        }
+        let mut prev = 0i32;
+        for &cum in row {
+            if cum < prev {
+                return bad("offset_table cumulative sample counts must be non-decreasing.");
+            }
+            let cnt = cum - prev;
+            if cnt > max_samples_per_pixel {
+                max_samples_per_pixel = cnt;
+            }
+            prev = cum;
+        }
+        let total_on_line = prev as usize;
+        let unpacked_bytes = (total_on_line as u64)
+            .saturating_mul(num_channels as u64)
+            .saturating_mul(4);
+        if unpacked_bytes > MAX_BLOCK {
+            return Err(ExrError::new(
+                ErrorCode::DATA_TOO_LARGE,
+                "Deep scanline sample block exceeds 1 GiB.",
+            ));
+        }
+        for ch_rows in &deep_image.image {
+            if ch_rows.len() != height || ch_rows[y].len() != total_on_line {
+                return bad(
+                    "Each channel's scanline sample vector must match offset_table's line total.",
+                );
+            }
+        }
+        line_totals.push(total_on_line);
+    }
+
+    let write_attr = |out: &mut Vec<u8>, name: &[u8], kind: &[u8], data: &[u8]| {
+        out.extend_from_slice(name);
+        out.push(0);
+        out.extend_from_slice(kind);
+        out.push(0);
+        out.extend_from_slice(&(data.len() as i32).to_le_bytes());
+        out.extend_from_slice(data);
+    };
+
+    // Magic + EXR 2.0 single-part deep scanline version (`[2, 8, 0, 0]`).
+    let mut out = vec![0x76, 0x2f, 0x31, 0x01, 2, 8, 0, 0];
+
+    let mut chlist = Vec::new();
+    for name in &clean_names {
+        chlist.extend_from_slice(name);
+        chlist.push(0);
+        chlist.extend_from_slice(&PixelType::FLOAT.0.to_le_bytes());
+        chlist.extend_from_slice(&[0, 0, 0, 0]);
+        chlist.extend_from_slice(&1i32.to_le_bytes());
+        chlist.extend_from_slice(&1i32.to_le_bytes());
+    }
+    chlist.push(0);
+    write_attr(&mut out, b"channels", b"chlist", &chlist);
+    write_attr(
+        &mut out,
+        b"compression",
+        b"compression",
+        &[Compression::ZIPS.0 as u8],
+    );
+
+    let mut window = Vec::with_capacity(16);
+    for v in [0i32, 0, deep_image.width - 1, deep_image.height - 1] {
+        window.extend_from_slice(&v.to_le_bytes());
+    }
+    write_attr(&mut out, b"dataWindow", b"box2i", &window);
+    write_attr(&mut out, b"displayWindow", b"box2i", &window);
+    write_attr(&mut out, b"lineOrder", b"lineOrder", &[0]);
+    write_attr(
+        &mut out,
+        b"pixelAspectRatio",
+        b"float",
+        &1.0f32.to_le_bytes(),
+    );
+    write_attr(&mut out, b"screenWindowCenter", b"v2f", &[0u8; 8]);
+    write_attr(
+        &mut out,
+        b"screenWindowWidth",
+        b"float",
+        &1.0f32.to_le_bytes(),
+    );
+    write_attr(&mut out, b"name", b"string", b"deep");
+    write_attr(&mut out, b"type", b"string", b"deepscanline");
+    write_attr(&mut out, b"version", b"int", &1i32.to_le_bytes());
+    write_attr(
+        &mut out,
+        b"chunkCount",
+        b"int",
+        &deep_image.height.to_le_bytes(),
+    );
+    write_attr(
+        &mut out,
+        b"maxSamplesPerPixel",
+        b"int",
+        &max_samples_per_pixel.to_le_bytes(),
+    );
+    out.push(0); // end of header
+
+    let offset_table_pos = out.len();
+    out.resize(offset_table_pos + height * 8, 0);
+
+    let mut compressor = miniz_nrp::Compressor::default();
+    let mut tmp_buf = Vec::new();
+    let mut raw_otab = vec![0u8; width * 4];
+    let mut packed_otab = Vec::new();
+    let mut raw_samples = Vec::new();
+    let mut packed_samples = Vec::new();
+
+    for (y, &samples_on_line) in line_totals.iter().enumerate() {
+        let chunk_offset = out.len() as u64;
+        out[offset_table_pos + y * 8..offset_table_pos + y * 8 + 8]
+            .copy_from_slice(&chunk_offset.to_le_bytes());
+
+        for (slot, &cum) in raw_otab
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(&deep_image.offset_table[y])
+        {
+            *slot = cum.to_le_bytes();
+        }
+        packed_otab.clear();
+        compress_zip_into(&raw_otab, &mut tmp_buf, &mut compressor, &mut packed_otab);
+
+        let unpacked_sample_bytes = samples_on_line * num_channels * 4;
+        packed_samples.clear();
+        if unpacked_sample_bytes > 0 {
+            raw_samples.clear();
+            raw_samples.resize(unpacked_sample_bytes, 0);
+            let mut cursor = 0usize;
+            for ch_rows in &deep_image.image {
+                let src = &ch_rows[y];
+                for (slot, &val) in raw_samples[cursor..cursor + samples_on_line * 4]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(src)
+                {
+                    *slot = val.to_bits().to_le_bytes();
+                }
+                cursor += samples_on_line * 4;
+            }
+            compress_zip_into(
+                &raw_samples,
+                &mut tmp_buf,
+                &mut compressor,
+                &mut packed_samples,
+            );
+        }
+
+        out.extend_from_slice(&(y as i32).to_le_bytes());
+        out.extend_from_slice(&(packed_otab.len() as i64).to_le_bytes());
+        out.extend_from_slice(&(packed_samples.len() as i64).to_le_bytes());
+        out.extend_from_slice(&(unpacked_sample_bytes as i64).to_le_bytes());
+        out.extend_from_slice(&packed_otab);
+        out.extend_from_slice(&packed_samples);
+    }
+
+    Ok(out)
+}
+
 /// Whether two images are the same, their samples bit for bit.
 fn same(a: &DeepImage, b: &DeepImage) -> bool {
     a.channel_names == b.channel_names
@@ -201,7 +414,6 @@ fn same(a: &DeepImage, b: &DeepImage) -> bool {
 }
 
 /// `LoadDeepEXR` itself.
-// (One pass, step for step as tinyexr's, its state shared throughout.)
 #[allow(clippy::too_many_lines)]
 fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     let file_size = memory.bytes.len();
@@ -209,7 +421,6 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         return Err(error(ErrorCode::INVALID_FILE, "File size is zero"));
     }
 
-    // Header check.
     if memory.read(0, 4)?[..] != [0x76, 0x2f, 0x31, 0x01] {
         return Err(error(
             ErrorCode::INVALID_MAGIC_NUMBER,
@@ -218,10 +429,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     }
     let mut marker = 4i64;
 
-    // Version, scanline.
     {
-        // ver 2.0, scanline, deep bit on(0x800)
-        // must be [2, 0, 0, 0]
         let version = memory.read(marker, 4)?;
         if version[0] != 2 || version[1] != 8 || version[2] != 0 || version[3] != 0 {
             return Err(error(
@@ -236,17 +444,15 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     let mut dy = -1i32;
     let mut dw = -1i32;
     let mut dh = -1i32;
-    let mut num_scanline_blocks = 1i32; // 16 for ZIP compression.
+    let mut num_scanline_blocks = 1i32;
     let mut compression_type = Compression(-1);
     let mut num_channels = -1i32;
-    let mut is_tiled = false; // deep *tiled* part (type == "deeptile")
+    let mut is_tiled = false;
     let mut tile_size_x = -1i32;
     let mut tile_size_y = -1i32;
-    let mut tile_level_mode = 0i32; // 0 = ONE_LEVEL
+    let mut tile_level_mode = 0i32;
     let mut channels: Vec<ChannelInfo> = Vec::new();
 
-    // Read attributes
-    // (A file shorter than its version leaves the original a size below zero, and reading on.)
     let mut size = (file_size as u64).wrapping_sub(8);
     loop {
         if size == 0 {
@@ -267,8 +473,6 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         marker += marker_size as i64;
         size -= marker_size as u64;
 
-        // (What the original reads of an attribute too short for it is not there: it stops, or
-        // reads past the attribute.)
         let need = |len: usize| {
             if data.len() < len {
                 Err(Stop::Outside)
@@ -297,12 +501,6 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                 }
             }
             "channels" => {
-                // name: zero-terminated string, from 1 to 255 bytes long
-                // pixel type: int, possible values are: UINT = 0 HALF = 1 FLOAT = 2
-                // pLinear: unsigned char, possible values are 0 and 1
-                // reserved: three chars, should be zero
-                // xSampling: int
-                // ySampling: int
                 if !read_channel_info(&mut channels, &data) {
                     return Err(error(
                         ErrorCode::INVALID_DATA,
@@ -324,11 +522,9 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                 dh = int_at(12);
             }
             "displayWindow" => {
-                // (Its values are not used: only what the original stops on matters.)
                 need(13)?;
             }
             "tiles" => {
-                // Deep tiled part: parse the tile descriptor (xSize, ySize, mode).
                 is_tiled = true;
                 if data.len() >= 9 {
                     tile_size_x = int_at(0);
@@ -365,13 +561,12 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         );
     }
 
-    // Read offset tables.
     let mut num_blocks = data_height / num_scanline_blocks;
     if num_blocks.wrapping_mul(num_scanline_blocks) < data_height {
         num_blocks += 1;
     }
     if num_blocks < 0 {
-        return Err(Stop::Outside); // (a table the original cannot allocate)
+        return Err(Stop::Outside);
     }
 
     let mut offsets = Vec::with_capacity(num_blocks.min(1 << 20) as usize);
@@ -393,7 +588,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     }
 
     if num_blocks > 0 && data_width <= 0 {
-        return Err(Stop::Outside); // (a line of no pixels, which the original stops on)
+        return Err(Stop::Outside);
     }
     let (width, height) = (data_width.max(0) as usize, data_height.max(0) as usize);
     if width as u64 * height as u64 > MAX_PIXELS {
@@ -409,21 +604,12 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     for &offset in &offsets {
         let y = deep_image.image[0].len();
 
-        // int: y coordinate
-        // int64: packed size of pixel offset table
-        // int64: packed size of sample data
-        // int64: unpacked size of sample data
-        // compressed pixel offset table
-        // compressed sample data
-        // (The line number is not used, and not read: built with optimisation, the original
-        // does not read it either.)
         let packed_offset_table_size = memory.i64_at(offset.wrapping_add(4))?;
         let packed_sample_data_size = memory.i64_at(offset.wrapping_add(12))?;
         let unpacked_sample_data_size = memory.i64_at(offset.wrapping_add(20))?;
 
         let mut pixel_offset_table = vec![0i32; width];
 
-        // decode pixel offset table.
         {
             let Some(table) = decompress_zip_from(
                 memory,
@@ -432,7 +618,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                 width as u64 * 4,
             )?
             else {
-                return Ok(unfinished()); // (the original's `return false`, which is 0)
+                return Ok(unfinished());
             };
 
             if table.len() != width * 4 {
@@ -447,14 +633,11 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
             deep_image.offset_table[y].copy_from_slice(&pixel_offset_table);
         }
 
-        // (A size below zero is one the original cannot allocate, and one past `MAX_BLOCK` one
-        // it may not be able to.)
         if unpacked_sample_data_size < 0 || unpacked_sample_data_size as u64 > MAX_BLOCK {
             return Err(Stop::Outside);
         }
         let mut sample_data = Vec::new();
 
-        // decode sample data.
         if unpacked_sample_data_size != 0 {
             let Some(samples) = decompress_zip_from(
                 memory,
@@ -473,7 +656,6 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
             sample_data = samples;
         }
 
-        // decode sample
         let mut channel_offset = 0i32;
         for channel in &channels {
             channel_offset += match channel.pixel_type {
@@ -497,9 +679,8 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
         {
             return Err(error(ErrorCode::INVALID_DATA, ""));
         }
-        let samples_per_line = (sample_data.len() as i32 / sample_size) as usize;
+        let samples_per_line = sample_data.len() / (sample_size as usize);
 
-        // pixel data is stored as image[channels][pixel_samples]
         let mut data_offset = 0usize;
         for (c, channel) in channels.iter().enumerate() {
             let line: Vec<f32> = match channel.pixel_type {
@@ -511,7 +692,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                                 .unwrap(),
                         ) as f32
                     })
-                    .collect(), // @fixme
+                    .collect(),
                 PixelType::HALF => (0..samples_per_line)
                     .map(|x| {
                         half_to_float(u16::from_le_bytes(
@@ -539,7 +720,7 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
                 };
             deep_image.image[c].push(line);
         }
-    } // y
+    }
 
     deep_image.width = data_width;
     deep_image.height = data_height;
@@ -552,22 +733,14 @@ fn load(memory: &Memory) -> Result<DeepImage, Stop> {
     Ok(deep_image)
 }
 
-/// What the original hands back when a block does not decompress, as far as a reader can
-/// make use of it: an image of no width, height or channels. (The lines it had made before
-/// are there, and not looked at; past the end of a damaged file they can be what is there.)
 fn unfinished() -> DeepImage {
     DeepImage::default()
 }
 
-/// The most bytes `src_len` bytes can come to: stored as they are, or deflated (which makes
-/// at most 1032 bytes of one), or run-length encoded (at most 128 of two).
 fn most_from(src_len: usize) -> u64 {
-    src_len as u64 * 1032 + 1024
+    (src_len as u64).saturating_mul(1032).saturating_add(1024)
 }
 
-/// `DecompressZip` of the `src_len` bytes at `at` into a block of `dst_len`, reading as far as
-/// its stream goes: the bytes it came to (as many as the stream holds, up to `dst_len`), or
-/// None where the original gives false.
 fn decompress_zip_from(
     memory: &Memory,
     at: i64,
@@ -575,20 +748,19 @@ fn decompress_zip_from(
     dst_len: u64,
 ) -> Result<Option<Vec<u8>>, Stop> {
     if dst_len == src_len {
-        // Data is not compressed (Issue 40).
         return Ok(Some(memory.read(at, src_len)?.into_owned()));
     }
-    // (A block of no bytes, which it stops on; or a larger one than it may be able to
-    // allocate.)
     if dst_len == 0 || dst_len > MAX_BLOCK {
         return Err(Stop::Outside);
     }
+    let Ok(dst_usize) = usize::try_from(dst_len) else {
+        return Err(Stop::Outside);
+    };
     if src_len > MZ_LIMIT {
-        return Ok(None); // (`mz_uncompress` fails without reading)
+        return Ok(None);
     }
     let src = memory.read_up_to(at, src_len)?;
-    // (No more can come out of the stream than this, so no more need be made room for.)
-    let room = dst_len.min(most_from(src.len())) as usize;
+    let room = dst_usize.min(usize::try_from(most_from(src.len())).unwrap_or(usize::MAX));
     match miniz_nrp::decompress_with(&src, Format::Zlib, room) {
         Ok(result) => {
             let mut tmp_buf = result.data;
@@ -596,8 +768,6 @@ fn decompress_zip_from(
             unpredict_and_reorder(&mut dst, &mut tmp_buf);
             Ok(Some(dst))
         }
-        // (A stream that runs on past what there is of it goes on past the end of the file. One
-        // that fails before then fails there.)
         Err(DecompressError::Truncated) if (src.len() as u64) < src_len => Err(Stop::Outside),
         Err(_) => Ok(None),
     }
@@ -614,11 +784,7 @@ fn decompress_deep(compression_type: Compression, dst: &mut [u8], src: &[u8]) ->
     decompress_zip(dst, src) == Some(dst.len())
 }
 
-/// `DecodeDeepTiled`: a single-level deep *tiled* part into the scanline-organized
-/// `DeepImage` (`offset_table`[y][x] = cumulative count within row y; image[c][y] = that row's
-/// samples concatenated in x order). `marker` is where the tile offset table is.
-// (Its parameters are tinyexr's, each a separate part of the state; one pass, step for step as
-// tinyexr's, its state shared throughout.)
+/// `DecodeDeepTiled`: a single-level deep *tiled* part into the scanline-organized `DeepImage`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn decode_deep_tiled(
     memory: &Memory,
@@ -632,8 +798,6 @@ fn decode_deep_tiled(
     tile_level_mode: TileLevelMode,
     mut marker: i64,
 ) -> Result<DeepImage, Stop> {
-    // A tile's place, its part of the image, and its block's sizes, as the original reads
-    // them.
     struct Tile {
         offset: u64,
         x0: usize,
@@ -644,8 +808,6 @@ fn decode_deep_tiled(
         psds: i64,
         usds: i64,
     }
-    // A tile's place and level, and the sizes of its offset table and of its samples (packed
-    // and unpacked).
     type TileHeader = (i32, i32, i32, i32, i64, i64, i64);
     let file_size = memory.bytes.len() as u64;
     if tile_size_x <= 0 || tile_size_y <= 0 {
@@ -691,7 +853,9 @@ fn decode_deep_tiled(
             }
         };
         ch_size.push(ps);
-        sample_size += ps;
+        sample_size = sample_size
+            .checked_add(ps)
+            .ok_or_else(|| error(ErrorCode::INVALID_DATA, "Too many channels in deep tile"))?;
     }
 
     let num_x_tiles = (i64::from(data_width) + i64::from(tile_size_x) - 1) / i64::from(tile_size_x);
@@ -700,13 +864,19 @@ fn decode_deep_tiled(
     let num_tiles = num_x_tiles as u64 * num_y_tiles as u64;
     let (num_x_tiles, num_y_tiles) = (num_x_tiles as i32, num_y_tiles as i32);
 
-    if marker as u64 + num_tiles.saturating_mul(8) > file_size {
+    if (marker as u64)
+        .checked_add(num_tiles.saturating_mul(8))
+        .is_none_or(|end| end > file_size)
+    {
         return Err(error(
             ErrorCode::INVALID_DATA,
             "Corrupt deep tiled offset table",
         ));
     }
-    let mut tile_offsets = Vec::with_capacity(num_tiles as usize);
+    let Ok(num_tiles_usize) = usize::try_from(num_tiles) else {
+        return Err(Stop::Outside);
+    };
+    let mut tile_offsets = Vec::with_capacity(num_tiles_usize.min(1 << 20));
     for _ in 0..num_tiles {
         tile_offsets.push(memory.i64_at(marker)? as u64);
         marker += 8;
@@ -731,10 +901,11 @@ fn decode_deep_tiled(
         ))
     };
     let place = |tile_x: i32, tile_y: i32| {
-        let (x0, y0) = (tile_x * tile_size_x, tile_y * tile_size_y);
-        let tw = tile_size_x.min(data_width - x0);
-        let th = tile_size_y.min(data_height - y0);
-        (x0 as usize, y0 as usize, tw as usize, th as usize)
+        let x0 = (i64::from(tile_x) * i64::from(tile_size_x)) as usize;
+        let y0 = (i64::from(tile_y) * i64::from(tile_size_y)) as usize;
+        let tw = (tile_size_x as usize).min(width - x0);
+        let th = (tile_size_y as usize).min(height - y0);
+        (x0, y0, tw, th)
     };
 
     // ---- Pass 1: per-tile offset tables -> per-pixel sample counts ----
@@ -754,15 +925,20 @@ fn decode_deep_tiled(
             return Err(error(ErrorCode::INVALID_DATA, "Corrupt deep tile header"));
         }
         let otab_packed = offset + 40;
-        if otab_packed + pots as u64 > file_size {
+        if otab_packed
+            .checked_add(pots as u64)
+            .is_none_or(|end| end > file_size)
+        {
             return Err(error(
                 ErrorCode::INVALID_DATA,
                 "Corrupt deep tile offset table",
             ));
         }
         let (x0, y0, tw, th) = place(tile_x, tile_y);
-        let need = tw * th;
-        let mut otab = vec![0u8; need * 4];
+        let Some(otab_bytes) = tw.checked_mul(th).and_then(|n| n.checked_mul(4)) else {
+            return Err(Stop::Outside);
+        };
+        let mut otab = vec![0u8; otab_bytes];
         let src = memory.read(otab_packed as i64, pots as u64)?;
         if !decompress_deep(compression_type, &mut otab, &src) {
             return Err(error(
@@ -770,7 +946,6 @@ fn decode_deep_tiled(
                 "Failed to decompress deep tile offset table",
             ));
         }
-        // The sample-count table is cumulative per scanline row within the tile.
         for ry in 0..th {
             let mut prev = 0i32;
             for rx in 0..tw {
@@ -799,25 +974,39 @@ fn decode_deep_tiled(
         });
     }
 
-    // ---- Build offset_table[y][x] ----
+    // ---- Build offset_table[y][x] with checked arithmetic ----
     let mut deep_image = DeepImage::default();
     let mut row_samples = vec![0usize; height];
+    let mut total_sample_bytes = 0u64;
     for y in 0..height {
         let mut row = Vec::with_capacity(width);
         let mut run = 0i32;
         for x in 0..width {
-            run = run.wrapping_add(counts[y * width + x]);
+            let Some(next_run) = run.checked_add(counts[y * width + x]) else {
+                return Err(error(
+                    ErrorCode::INVALID_DATA,
+                    "Corrupt deep tile (sample count overflow)",
+                ));
+            };
+            run = next_run;
             row.push(run);
         }
-        row_samples[y] = run as isize as usize;
+        let n = run as usize;
+        row_samples[y] = n;
+        total_sample_bytes = total_sample_bytes.saturating_add(
+            (n as u64)
+                .saturating_mul(num_channels as u64)
+                .saturating_mul(4),
+        );
+        if total_sample_bytes > MAX_BLOCK {
+            return Err(Stop::Outside);
+        }
         deep_image.offset_table.push(row);
     }
 
     // ---- Pass 2: per-tile (channel-planar) sample data ----
-    // (Every block is checked and decompressed before the rows are made: the original makes
-    // them first, but nothing it does with them can fail, and a block that does not add up is
-    // found before rows of more samples than there can be are made.)
     let mut blocks = Vec::with_capacity(tiles.len());
+    let mut total_block_bytes = 0u64;
     for tile in &tiles {
         let Tile {
             offset,
@@ -835,8 +1024,19 @@ fn decode_deep_tiled(
                 "Corrupt deep tile sample sizes",
             ));
         }
-        let samp_packed = offset + 40 + pots as u64;
-        if samp_packed + psds as u64 > file_size {
+        let Some(samp_packed) = offset
+            .checked_add(40)
+            .and_then(|v| v.checked_add(pots as u64))
+        else {
+            return Err(error(
+                ErrorCode::INVALID_DATA,
+                "Corrupt deep tile sample data",
+            ));
+        };
+        if samp_packed
+            .checked_add(psds as u64)
+            .is_none_or(|end| end > file_size)
+        {
             return Err(error(
                 ErrorCode::INVALID_DATA,
                 "Corrupt deep tile sample data",
@@ -846,26 +1046,36 @@ fn decode_deep_tiled(
         let mut tile_total = 0u64;
         for ry in 0..th {
             for rx in 0..tw {
-                tile_total =
-                    tile_total.wrapping_add(i64::from(counts[(y0 + ry) * width + x0 + rx]) as u64);
+                tile_total = tile_total.saturating_add(counts[(y0 + ry) * width + x0 + rx] as u64);
             }
         }
-        if usds != (tile_total as i64).wrapping_mul(i64::from(sample_size)) {
+        let expected_usds = tile_total.checked_mul(sample_size as u64);
+        if expected_usds != Some(usds as u64) {
             return Err(error(
                 ErrorCode::INVALID_DATA,
                 "Deep tile sample size mismatch",
             ));
         }
+        let usds_u64 = usds as u64;
+        if usds_u64 > MAX_BLOCK {
+            return Err(Stop::Outside);
+        }
+        total_block_bytes = total_block_bytes.saturating_add(usds_u64);
+        if total_block_bytes > MAX_BLOCK {
+            return Err(Stop::Outside);
+        }
+        let Ok(usds_usize) = usize::try_from(usds_u64) else {
+            return Err(Stop::Outside);
+        };
+
         let src = memory.read(samp_packed as i64, psds as u64)?;
-        let usds = usds as u64;
-        // (A block that says more than its bytes can come to does not come out that long.)
-        if usds != src.len() as u64 && usds > most_from(src.len()) {
+        if usds_u64 != src.len() as u64 && usds_u64 > most_from(src.len()) {
             return Err(error(
                 ErrorCode::INVALID_DATA,
                 "Failed to decompress deep tile sample data",
             ));
         }
-        let mut sbuf = vec![0u8; usds as usize];
+        let mut sbuf = vec![0u8; usds_usize];
         if !decompress_deep(compression_type, &mut sbuf, &src) {
             return Err(error(
                 ErrorCode::INVALID_DATA,
@@ -881,32 +1091,40 @@ fn decode_deep_tiled(
         .collect();
     for (tile, sbuf) in tiles.iter().zip(&blocks) {
         let Tile { x0, y0, tw, th, .. } = *tile;
-        // Sample data is stored one tile-row at a time, each row channel-planar
-        // (i.e. the tile is a stack of `th` deep "scanlines" of width `tw`), which
-        // is why the offset table is cumulative per row.
-        let mut offset = 0usize; // byte offset within sbuf
+        let mut offset = 0usize;
         for ry in 0..th {
             let gy = y0 + ry;
             for (c, channel) in channels.iter().enumerate() {
                 let ps = ch_size[c] as usize;
-                let mut local = 0usize; // sample index within this (row, channel) block
+                let mut local = 0usize;
                 for rx in 0..tw {
                     let gx = x0 + rx;
                     let cnt = counts[gy * width + gx] as usize;
-                    let row_start =
-                        (deep_image.offset_table[gy][gx] as isize - cnt as isize) as usize;
-                    let sp = offset + local * ps;
-                    let dst = &mut deep_image.image[c][gy][row_start..row_start + cnt];
+                    let cum = deep_image.offset_table[gy][gx] as usize;
+                    let Some(row_start) = cum.checked_sub(cnt) else {
+                        return Err(error(ErrorCode::INVALID_DATA, "Corrupt deep tile offsets"));
+                    };
+                    let Some(sp) = local.checked_mul(ps).and_then(|v| offset.checked_add(v)) else {
+                        return Err(error(ErrorCode::INVALID_DATA, "Corrupt deep tile offsets"));
+                    };
+                    let Some(dst) = deep_image.image[c][gy].get_mut(row_start..row_start + cnt)
+                    else {
+                        return Err(error(ErrorCode::INVALID_DATA, "Corrupt deep tile offsets"));
+                    };
                     for (s, value) in dst.iter_mut().enumerate() {
                         let at = sp + s * ps;
+                        let Some(bytes) = sbuf.get(at..at + ps) else {
+                            return Err(error(
+                                ErrorCode::INVALID_DATA,
+                                "Corrupt deep tile sample data",
+                            ));
+                        };
                         *value = match channel.pixel_type {
-                            PixelType::UINT => {
-                                u32::from_le_bytes(sbuf[at..at + 4].try_into().unwrap()) as f32
+                            PixelType::UINT => u32::from_le_bytes(bytes.try_into().unwrap()) as f32,
+                            PixelType::HALF => {
+                                half_to_float(u16::from_le_bytes(bytes.try_into().unwrap()))
                             }
-                            PixelType::HALF => half_to_float(u16::from_le_bytes(
-                                sbuf[at..at + 2].try_into().unwrap(),
-                            )),
-                            _ => f32::from_le_bytes(sbuf[at..at + 4].try_into().unwrap()),
+                            _ => f32::from_le_bytes(bytes.try_into().unwrap()),
                         };
                     }
                     local += cnt;
@@ -962,7 +1180,6 @@ mod tests {
         attribute(&mut file, "dataWindow", "box2i", &window);
         attribute(&mut file, "displayWindow", "box2i", &window);
         file.push(0);
-        // Line y has pixel counts 1 and y + 1: cumulative 1, y + 2.
         let table_at = file.len();
         file.extend_from_slice(&[0; 16]);
         for y in 0..2u8 {
@@ -976,7 +1193,6 @@ mod tests {
             let samples: Vec<u8> = (0..i32::from(y) + 2)
                 .flat_map(|s| (s as f32 + 10.0 * f32::from(y)).to_le_bytes())
                 .collect();
-            // (Stored as they are: a block as long as its bytes is taken for them.)
             let packed_table = cumulative.clone();
             let packed_samples = if y == 0 {
                 samples.clone()
@@ -993,7 +1209,6 @@ mod tests {
         file
     }
 
-    /// ZIP's reordering and predictor, as a writer applies them.
     fn predict(src: &[u8]) -> Vec<u8> {
         let half = src.len().div_ceil(2);
         let mut t = vec![0u8; src.len()];
@@ -1026,11 +1241,48 @@ mod tests {
     }
 
     #[test]
+    fn save_deep_round_trips_through_load_deep_and_validates_inputs() {
+        let orig = DeepImage {
+            channel_names: vec!["A".to_string(), "Z".to_string()],
+            image: vec![
+                vec![vec![0.25, 0.75, 1.0], vec![], vec![0.5]],
+                vec![vec![1.5, 2.5, 9.0], vec![], vec![-0.0]],
+            ],
+            offset_table: vec![vec![1, 1, 3, 3], vec![0, 0, 0, 0], vec![0, 1, 1, 1]],
+            num_channels: 2,
+            width: 4,
+            height: 3,
+        };
+        let encoded = save_deep(&orig).unwrap();
+        let ver = crate::parse_version(&encoded).unwrap();
+        assert!(ver.non_image && !ver.tiled && !ver.multipart);
+        let hdr = crate::parse_header(ver, &encoded).unwrap();
+        assert!(hdr.non_image);
+        assert_eq!(hdr.channels.len(), 2);
+
+        let decoded = load_deep(&encoded).unwrap();
+        assert!(same(&orig, &decoded));
+
+        // Invalid inputs are cleanly rejected.
+        let mut bad = orig.clone();
+        bad.offset_table[0] = vec![2, 1, 3, 3]; // decreasing cumulative count
+        assert_eq!(
+            save_deep(&bad).unwrap_err().code,
+            ErrorCode::INVALID_ARGUMENT
+        );
+
+        let mut dup = orig.clone();
+        dup.channel_names = vec!["Z".to_string(), "Z".to_string()];
+        assert_eq!(
+            save_deep(&dup).unwrap_err().code,
+            ErrorCode::INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
     fn a_deep_file_cut_short_is_refused() {
         let file = deep_file();
         for len in [0, 3, 7, 40, file.len() - 30, file.len() - 1] {
-            // (Refused, or, where a compressed block is cut, handed back unfinished, as the
-            // original does: with no width.)
             assert!(
                 load_deep(&file[..len]).is_ok_and(|image| image.width == 0)
                     || load_deep(&file[..len]).is_err(),

@@ -20,7 +20,7 @@ not support, as OpenEXR does.
   tinyexr adds with `TINYEXR_USE_ZFP` ([zfp_nrp](https://github.com/OctoKeights/zfp_nrp)).
 
 - **Every layout.** Scanlines and tiles with mip and rip levels, files of several parts, and
-  deep images (read only); halves, floats and 32-bit integers.
+  deep images; halves, floats and 32-bit integers.
 
 - **Damaged files refused safely.** Where tinyexr would read past the end of a damaged file
   or stop, tinyexr_nrp refuses it.

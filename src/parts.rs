@@ -1,14 +1,9 @@
 //! Files of many parts: a port of `ParseEXRMultipartHeaderFromMemory` and
-//! `LoadEXRMultipartImageFromMemory` of tinyexr v3.4.0 (`tinyexr.h`). (The writer is
+//! `LoadEXRMultipartImageFromMemory` of tinyexr v3.4.0 (`tinyexr.h`), plus selective
+//! single-part decoding ([`load_multipart_part`]). (The writer is
 //! [`super::save_multipart_images`].)
-//!
-//! Both read past the end of a damaged file: the first parses every header as if the whole
-//! of the file after the first one were left, the second reads its table of offsets, and the
-//! number of the part before each block, without a look at where the file ends. Here those
-//! reads are made as the original makes them, with what is past the end taken to be all
-//! zeros and then all ones. Where the answer is the same either way it is the original's
-//! answer whatever its memory holds, and it is given; where it is not, the file is refused
-//! with [`PAST_THE_END`].
+
+use alloc::{string::ToString, vec, vec::Vec};
 
 use super::chunk::{OffsetData, decode_chunk, precalculate_tile_info, tile_offsets_shape};
 use super::{
@@ -65,8 +60,6 @@ fn parse_multipart_header(
             message: "Data size too short".to_string(),
         });
     }
-    // (Every header but the first is read as if it had the whole of the file after the first
-    // header to itself: the second time round, with ones past the end.)
     let (zeros, beyond) = parse_headers(version, memory, 0x00, as_tinyexr);
     if !beyond {
         return zeros;
@@ -81,7 +74,6 @@ fn parse_multipart_header(
 
 /// Whether two answers are the same, their floats bit for bit.
 fn same(a: &Result<Vec<ExrHeader>, ExrError>, b: &Result<Vec<ExrHeader>, ExrError>) -> bool {
-    // (The floats compared as bits, and the rest with them set aside.)
     fn floats(header: &ExrHeader) -> [u32; 4] {
         [
             header.pixel_aspect_ratio.to_bits(),
@@ -144,7 +136,6 @@ fn parse_headers(
             Err(error) => return (Err(error), beyond),
         }
 
-        // `chunkCount` must exist in the header.
         if info.chunk_count == 0 {
             return (
                 Err(ExrError {
@@ -155,13 +146,11 @@ fn parse_headers(
             );
         }
 
-        // move to next header.
         marker += info.header_len as usize;
         infos.push(info);
     }
 
     let mut headers = Vec::with_capacity(infos.len());
-    // (Every header is converted; the last that fails is the one given.)
     let mut failure = None;
     for info in &infos {
         let mut exr_header = convert_header(info).unwrap_or_else(|message| {
@@ -180,9 +169,7 @@ fn parse_headers(
     (Ok(headers), beyond)
 }
 
-/// What a read of bytes past the end of the file makes of the rest: with zeros past the end
-/// the original goes on, with ones it stops with this error. (Ones past the end make every
-/// such offset and part number too large, and zeros may not.)
+/// What a read of bytes past the end of the file makes of the rest.
 struct Divergence {
     error: ExrError,
 }
@@ -234,6 +221,44 @@ pub fn load_multipart_images_as_tinyexr(
     load_parts(exr_headers, memory, true)
 }
 
+/// Decodes only the single part at `part_index` (`0..exr_headers.len()`) from a multipart
+/// `.exr` file in `memory`, without allocating or decompressing the other parts.
+///
+/// Updates `exr_headers[part_index].pixel_types` to `requested_pixel_types`, leaving all
+/// other headers in `exr_headers` unchanged.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::INVALID_ARGUMENT`] if `exr_headers` is empty, `part_index` is out of
+/// bounds, or a header is uninitialized, or [`ExrError`] if the offset tables or target
+/// part's chunks are damaged.
+pub fn load_multipart_part(
+    exr_headers: &mut [ExrHeader],
+    part_index: usize,
+    memory: &[u8],
+) -> Result<ExrImage, ExrError> {
+    if part_index >= exr_headers.len() {
+        return Err(ExrError {
+            code: ErrorCode::INVALID_ARGUMENT,
+            message: "Part index out of range for LoadEXRMultipartPart".to_string(),
+        });
+    }
+    let header_before = exr_headers[part_index].clone();
+    let mut divergence: Option<Divergence> = None;
+    let result =
+        load_single_part_with_zeros(exr_headers, part_index, memory, false, &mut divergence);
+    match divergence {
+        None => result,
+        Some(Divergence { error }) => match result {
+            Err(ref zeros) if *zeros == error => result,
+            _ => {
+                exr_headers[part_index] = header_before;
+                Err(past_the_end())
+            }
+        },
+    }
+}
+
 fn load_parts(
     exr_headers: &mut [ExrHeader],
     memory: &[u8],
@@ -244,8 +269,6 @@ fn load_parts(
     let result = load_parts_with_zeros(exr_headers, memory, as_tinyexr, &mut divergence);
     match divergence {
         None => result,
-        // With ones past the end the original stopped with an error there; with zeros it went
-        // on to `result`. The same either way, or not.
         Some(Divergence { error }) => match result {
             Err(ref zeros) if *zeros == error => result,
             _ => {
@@ -256,14 +279,14 @@ fn load_parts(
     }
 }
 
-/// The original, with zeros past the end of the file: and where it first read past the end in
-/// a way ones there would have stopped it, how.
-fn load_parts_with_zeros(
-    exr_headers: &mut [ExrHeader],
+/// Validates and advances `marker` past `exr_header`'s offset table, returning `Some(OffsetData)`
+/// when `collect_offsets` is `true` and `None` when skipping non-selected parts.
+fn read_part_offset_table(
+    exr_header: &ExrHeader,
     memory: &[u8],
-    as_tinyexr: bool,
-    divergence: &mut Option<Divergence>,
-) -> Result<Vec<ExrImage>, ExrError> {
+    marker: &mut usize,
+    collect_offsets: bool,
+) -> Result<Option<OffsetData>, ExrError> {
     fn fail<T>(message: &str) -> Result<T, ExrError> {
         Err(ExrError {
             code: ErrorCode::INVALID_DATA,
@@ -271,42 +294,6 @@ fn load_parts_with_zeros(
         })
     }
     let size = memory.len();
-    let num_parts = exr_headers.len();
-    if num_parts == 0 || size <= EXR_VERSION_SIZE {
-        return Err(ExrError {
-            code: ErrorCode::INVALID_ARGUMENT,
-            message: "Invalid argument for LoadEXRMultipartImageFromMemory()".to_string(),
-        });
-    }
-
-    // compute total header size.
-    let mut total_header_size = 0usize;
-    for exr_header in exr_headers.iter() {
-        if exr_header.header_len == 0 {
-            return Err(ExrError {
-                code: ErrorCode::INVALID_ARGUMENT,
-                message: "EXRHeader variable is not initialized.".to_string(),
-            });
-        }
-        total_header_size += exr_header.header_len as usize;
-    }
-
-    let mut marker = total_header_size + 4 + 4; // +8 for magic number and version header.
-    marker += 1; // Skip empty header.
-
-    // NOTE 1:
-    //   In multipart image, There is 'part number' before chunk data.
-    //   4 byte : part number
-    //   4+     : chunk
-    //
-    // NOTE 2:
-    //   EXR spec says 'part number' is 'unsigned long' but actually this is
-    //   'unsigned int(4 bytes)' in OpenEXR implementation...
-    //   http://www.openexr.com/openexrfilelayout.pdf
-
-    // One entry of a table of offsets, and past the end of the file what zeros there make of
-    // it. (Once past the end with zeros, nothing the original goes on to do can end in the
-    // error ones there end in: the offsets read as 0 from then on, which it takes.)
     let read_offset = |marker: &mut usize| -> Result<u64, ExrError> {
         let (offset, beyond) = read_le::<8>(memory, *marker);
         if offset >= size as u64 {
@@ -315,72 +302,144 @@ fn load_parts_with_zeros(
         if beyond {
             return Err(past_the_end());
         }
-        *marker += 8;
+        *marker = marker.checked_add(8).ok_or_else(past_the_end)?;
         Ok(offset + 4) // +4 to skip 'part number'
     };
 
-    // Load chunk offset table.
-    let mut chunk_offset_table_list: Vec<OffsetData> = Vec::with_capacity(num_parts);
-    for exr_header in exr_headers.iter() {
-        let mut offset_data = OffsetData::default();
-        if !exr_header.tiled || exr_header.tile_level_mode == TileLevelMode::ONE_LEVEL {
-            // `InitSingleResolutionOffsets`. (A count below zero is one the original cannot
-            // make a table of, which stops it.)
-            if exr_header.chunk_count < 0 {
-                return Err(past_the_end());
-            }
-            let mut offsets = Vec::new();
-            for _ in 0..exr_header.chunk_count {
-                offsets.push(read_offset(&mut marker)?);
+    let mut offset_data = OffsetData::default();
+    if !exr_header.tiled || exr_header.tile_level_mode == TileLevelMode::ONE_LEVEL {
+        if exr_header.chunk_count < 0 {
+            return Err(past_the_end());
+        }
+        let count = exr_header.chunk_count as usize;
+        if collect_offsets {
+            let cap = count.min(size.saturating_sub(*marker) / 8);
+            let mut offsets = Vec::with_capacity(cap);
+            for _ in 0..count {
+                offsets.push(read_offset(marker)?);
             }
             offset_data.offsets = vec![vec![offsets]];
             offset_data.num_x_levels = 1;
             offset_data.num_y_levels = 1;
+            Ok(Some(offset_data))
         } else {
-            let Some((num_x_tiles, num_y_tiles)) = precalculate_tile_info(exr_header) else {
-                return fail("Invalid tile info.");
-            };
-            let (shape, num_blocks) =
-                tile_offsets_shape(&mut offset_data, exr_header, &num_x_tiles, &num_y_tiles);
-            if num_blocks != exr_header.chunk_count {
-                return fail("Invalid offset table size.");
+            for _ in 0..count {
+                read_offset(marker)?;
             }
+            Ok(None)
+        }
+    } else {
+        let Some((num_x_tiles, num_y_tiles)) = precalculate_tile_info(exr_header) else {
+            return fail("Invalid tile info.");
+        };
+        let (shape, num_blocks) =
+            tile_offsets_shape(&mut offset_data, exr_header, &num_x_tiles, &num_y_tiles);
+        if num_blocks != exr_header.chunk_count {
+            return fail("Invalid offset table size.");
+        }
+        if collect_offsets {
+            // Cap pre-allocation to what the remaining file bytes can hold.
+            let max_rem = size.saturating_sub(*marker) / 8;
+            offset_data.offsets = Vec::with_capacity(shape.len().min(max_rem));
             for &(rows, columns) in &shape {
-                let mut level = Vec::with_capacity(rows);
+                let row_cap = rows.min(size.saturating_sub(*marker) / 8).min(1024);
+                let mut level = Vec::with_capacity(row_cap);
                 for _ in 0..rows {
-                    let mut row = Vec::with_capacity(columns);
+                    let col_cap = columns.min(size.saturating_sub(*marker) / 8);
+                    let mut row = Vec::with_capacity(col_cap);
                     for _ in 0..columns {
-                        row.push(read_offset(&mut marker)?);
+                        row.push(read_offset(marker)?);
                     }
                     level.push(row);
                 }
                 offset_data.offsets.push(level);
             }
+            Ok(Some(offset_data))
+        } else {
+            for &(rows, columns) in &shape {
+                for _ in 0..rows {
+                    for _ in 0..columns {
+                        read_offset(marker)?;
+                    }
+                }
+            }
+            Ok(None)
         }
+    }
+}
+
+fn compute_offset_table_start(exr_headers: &[ExrHeader], size: usize) -> Result<usize, ExrError> {
+    if exr_headers.is_empty() || size <= EXR_VERSION_SIZE {
+        return Err(ExrError {
+            code: ErrorCode::INVALID_ARGUMENT,
+            message: "Invalid argument for LoadEXRMultipartImageFromMemory()".to_string(),
+        });
+    }
+    let mut total_header_size = 0usize;
+    for exr_header in exr_headers {
+        if exr_header.header_len == 0 {
+            return Err(ExrError {
+                code: ErrorCode::INVALID_ARGUMENT,
+                message: "EXRHeader variable is not initialized.".to_string(),
+            });
+        }
+        total_header_size = total_header_size
+            .checked_add(exr_header.header_len as usize)
+            .ok_or_else(past_the_end)?;
+    }
+    // +8 for magic number and version header, +1 to skip empty header terminator.
+    let marker = total_header_size.checked_add(9).ok_or_else(past_the_end)?;
+    if marker > size {
+        return Err(past_the_end());
+    }
+    Ok(marker)
+}
+
+fn validate_part_numbers(
+    part_index: usize,
+    offset_data: &OffsetData,
+    memory: &[u8],
+    divergence: &mut Option<Divergence>,
+) -> Result<(), ExrError> {
+    for &offset in offset_data.offsets.iter().flatten().flatten() {
+        let (part_no, beyond) = read_le::<4>(memory, offset as usize - 4);
+        if part_no != part_index as u64 {
+            return Err(ExrError {
+                code: ErrorCode::INVALID_DATA,
+                message: "Invalid `part number' in EXR header chunks.".to_string(),
+            });
+        }
+        if beyond && divergence.is_none() {
+            *divergence = Some(Divergence {
+                error: ExrError {
+                    code: ErrorCode::INVALID_DATA,
+                    message: "Invalid `part number' in EXR header chunks.".to_string(),
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+fn load_parts_with_zeros(
+    exr_headers: &mut [ExrHeader],
+    memory: &[u8],
+    as_tinyexr: bool,
+    divergence: &mut Option<Divergence>,
+) -> Result<Vec<ExrImage>, ExrError> {
+    let mut marker = compute_offset_table_start(exr_headers, memory.len())?;
+    let num_parts = exr_headers.len();
+
+    let mut chunk_offset_table_list: Vec<OffsetData> = Vec::with_capacity(num_parts.min(1024));
+    for exr_header in exr_headers.iter() {
+        let offset_data = read_part_offset_table(exr_header, memory, &mut marker, true)?
+            .expect("collected offsets");
         chunk_offset_table_list.push(offset_data);
     }
 
-    // Decode image.
-    let mut exr_images = Vec::with_capacity(num_parts);
+    let mut exr_images = Vec::with_capacity(num_parts.min(1024));
     for (i, offset_data) in chunk_offset_table_list.iter().enumerate() {
-        // First check 'part number' is identical to 'i'
-        for &offset in offset_data.offsets.iter().flatten().flatten() {
-            // -4 to move to 'part number' field.
-            let (part_no, beyond) = read_le::<4>(memory, offset as usize - 4);
-            if part_no != i as u64 {
-                return fail("Invalid `part number' in EXR header chunks.");
-            }
-            if beyond && divergence.is_none() {
-                // (With ones past the end, the number is never `i`.)
-                *divergence = Some(Divergence {
-                    error: ExrError {
-                        code: ErrorCode::INVALID_DATA,
-                        message: "Invalid `part number' in EXR header chunks.".to_string(),
-                    },
-                });
-            }
-        }
-
+        validate_part_numbers(i, offset_data, memory, divergence)?;
         exr_images.push(decode_chunk(
             &mut exr_headers[i],
             offset_data,
@@ -392,12 +451,41 @@ fn load_parts_with_zeros(
     Ok(exr_images)
 }
 
+fn load_single_part_with_zeros(
+    exr_headers: &mut [ExrHeader],
+    part_index: usize,
+    memory: &[u8],
+    as_tinyexr: bool,
+    divergence: &mut Option<Divergence>,
+) -> Result<ExrImage, ExrError> {
+    let mut marker = compute_offset_table_start(exr_headers, memory.len())?;
+
+    let mut selected_offsets: Option<OffsetData> = None;
+    for (i, exr_header) in exr_headers.iter().enumerate() {
+        let got = read_part_offset_table(exr_header, memory, &mut marker, i == part_index)?;
+        if i == part_index {
+            selected_offsets = got;
+        }
+    }
+
+    let offset_data = selected_offsets.expect("part_index < exr_headers.len()");
+    validate_part_numbers(part_index, &offset_data, memory, divergence)?;
+    decode_chunk(
+        &mut exr_headers[part_index],
+        &offset_data,
+        memory,
+        as_tinyexr,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ChannelData, ChannelInfo, Compression, ExrHeader, ExrImage, PixelType,
-        load_multipart_images, parse_multipart_headers, parse_version, save_multipart_images,
+        ChannelData, ChannelInfo, Compression, ErrorCode, ExrHeader, ExrImage, PixelType,
+        load_multipart_images, load_multipart_part, parse_multipart_headers, parse_version,
+        save_multipart_images,
     };
+    use alloc::{string::ToString, vec, vec::Vec};
 
     fn part(name: &str, width: i32, height: i32, value: f32) -> (ExrImage, ExrHeader) {
         let image = ExrImage {
@@ -439,6 +527,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["left", "right"]
         );
+
+        // Selective single-part decode of part 1 only:
+        let mut selective_headers = headers.clone();
+        selective_headers[1].requested_pixel_types[0] = PixelType::FLOAT;
+        let only_right = load_multipart_part(&mut selective_headers, 1, &file).unwrap();
+        assert_eq!((only_right.width, only_right.height), (3, 40));
+        assert_eq!(only_right.images[0], ChannelData::Float(vec![2.0; 120]));
+        // Part 0's header was left untouched (`pixel_types` stayed HALF).
+        assert_eq!(selective_headers[0].pixel_types, vec![PixelType::HALF]);
+        assert_eq!(selective_headers[1].pixel_types, vec![PixelType::FLOAT]);
+        assert_eq!(
+            load_multipart_part(&mut selective_headers, 2, &file)
+                .unwrap_err()
+                .code,
+            ErrorCode::INVALID_ARGUMENT
+        );
+
         let images = load_multipart_images(&mut headers, &file).unwrap();
         assert_eq!(
             (
@@ -477,7 +582,6 @@ mod tests {
         let file = save_multipart_images(&[(&a, &a_header), (&b, &b_header)]).unwrap();
         let version = parse_version(&file).unwrap();
         let mut headers = parse_multipart_headers(version, &file).unwrap();
-        // Cut in the table of offsets: the original reads the rest of it past the end.
         let end_of_headers = 8
             + headers
                 .iter()

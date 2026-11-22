@@ -2,19 +2,49 @@
 //! image. A port of `DecodeEXRImage`, `DecodeChunk`, `DecodeTiledLevel` and the functions
 //! around them in tinyexr v3.4.0 (`tinyexr.h`).
 
+use alloc::{format, string::String, vec, vec::Vec};
+
 use super::decode::{
-    allocate_image, compute_channel_layout, decode_pixel_data, decode_tiled_pixel_data,
+    ChannelViewMut, DecodeScratch, allocate_image, compute_channel_layout,
+    decode_pixel_data_with_scratch, decode_tiled_pixel_data_with_scratch, decoded_bytes_per_pixel,
 };
-use super::zfp::{ZfpParam, find_zfp_compression_param};
+use super::zfp::ZfpParam;
+#[cfg(feature = "zfp")]
+use super::zfp::find_zfp_compression_param;
 use super::{
-    Compression, ErrorCode, ExrError, ExrHeader, ExrImage, ExrTile, LineOrder, TileLevelMode,
-    TileRoundingMode,
+    ChannelData, Compression, ErrorCode, ExrError, ExrHeader, ExrImage, ExrTile, LineOrder,
+    TileLevelMode, TileRoundingMode,
 };
 
 const EXR_VERSION_SIZE: usize = 8;
 
 /// Larger images and tiles than this are refused (`TINYEXR_DIMENSION_THRESHOLD`).
 const DIMENSION_THRESHOLD: i64 = 1024 * 8192;
+
+/// Cap on total decoded tile channel memory across all levels of an image (1 GiB on 64-bit,
+/// 256 MiB on 32-bit), preventing chunk-offset deduplication OOM bombs in tiny files.
+#[cfg(target_pointer_width = "64")]
+const MAX_TILED_IMAGE_BYTES: usize = 1 << 30;
+#[cfg(not(target_pointer_width = "64"))]
+const MAX_TILED_IMAGE_BYTES: usize = 1 << 28;
+
+/// Resolves `num_threads` (`0` = `std::thread::available_parallelism`, `>= 1` = exact count).
+#[inline]
+pub(crate) fn effective_threads(num_threads: usize) -> usize {
+    #[cfg(feature = "std")]
+    {
+        if num_threads == 0 {
+            std::thread::available_parallelism().map_or(1, core::num::NonZeroUsize::get)
+        } else {
+            num_threads
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = num_threads;
+        1
+    }
+}
 
 /// `OffsetData`: where each block of a file starts: `offsets[level][tile y][tile x]`, or
 /// `offsets[0][0][block]` for a file of scanlines.
@@ -63,7 +93,6 @@ fn level_size(toplevel_size: i32, level: i32, tile_rounding_mode: TileRoundingMo
     }
 
     let b = 1u32.wrapping_shl(level as u32) as i32;
-    // (The original divides by zero for a level of 32 or more, which no image has.)
     if b == 0 {
         return -1;
     }
@@ -78,9 +107,153 @@ fn level_size(toplevel_size: i32, level: i32, tile_rounding_mode: TileRoundingMo
     level_size.max(1)
 }
 
+const EF_INVALID_DATA: u32 = 1;
+const EF_INSUFFICIENT_DATA: u32 = 2;
+const EF_FAILED_TO_DECODE: u32 = 4;
+
+/// Decodes a single tile at `tile_idx` into `tile`, returning its `EF_*` error flags.
+#[allow(clippy::too_many_arguments)]
+fn decode_one_tile(
+    tile_idx: i32,
+    num_x_tiles: i32,
+    level_x: i32,
+    level_y: i32,
+    level_width: i32,
+    level_height: i32,
+    types_are_valid: bool,
+    exr_header: &ExrHeader,
+    level_offsets: &[Vec<u64>],
+    channel_offset_list: &[usize],
+    pixel_data_size: i32,
+    head: &[u8],
+    zfp: Option<&ZfpParam>,
+    as_tinyexr: bool,
+    scratch: &mut DecodeScratch,
+) -> (ExrTile, u32) {
+    let mut tile = ExrTile::default();
+    let mut error_flag = 0u32;
+    let size = head.len();
+
+    'tile: {
+        if !types_are_valid {
+            error_flag |= EF_INVALID_DATA;
+            break 'tile;
+        }
+
+        let x_tile = tile_idx % num_x_tiles;
+        let y_tile = tile_idx / num_x_tiles;
+        let Some(&offset) = level_offsets
+            .get(y_tile as usize)
+            .and_then(|row| row.get(x_tile as usize))
+        else {
+            error_flag |= EF_INVALID_DATA;
+            break 'tile;
+        };
+        if offset.checked_add(20).is_none_or(|end| end > size as u64) {
+            error_flag |= EF_INSUFFICIENT_DATA;
+            break 'tile;
+        }
+
+        let data_size = size - (offset as usize + 20);
+        let mut data_ptr = offset as usize;
+
+        let int_at =
+            |at: usize| i32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
+        let tile_coordinates = [
+            int_at(data_ptr),
+            int_at(data_ptr + 4),
+            int_at(data_ptr + 8),
+            int_at(data_ptr + 12),
+        ];
+
+        if tile_coordinates[2] != level_x || tile_coordinates[3] != level_y {
+            error_flag |= EF_INVALID_DATA;
+            break 'tile;
+        }
+
+        let data_len = int_at(data_ptr + 16);
+        if data_len < 2 || data_len as usize > data_size {
+            error_flag |= EF_INSUFFICIENT_DATA;
+            break 'tile;
+        }
+
+        data_ptr += 20;
+        let Some(mut images) = allocate_image(
+            &exr_header.channels,
+            &exr_header.requested_pixel_types,
+            exr_header.tile_size_x,
+            exr_header.tile_size_y,
+        ) else {
+            error_flag |= EF_INVALID_DATA;
+            break 'tile;
+        };
+        let decoded = decode_tiled_pixel_data_with_scratch(
+            &mut images,
+            &exr_header.requested_pixel_types,
+            &head[data_ptr..],
+            data_len as usize,
+            exr_header.compression_type,
+            level_width,
+            level_height,
+            tile_coordinates[0],
+            tile_coordinates[1],
+            exr_header.tile_size_x,
+            exr_header.tile_size_y,
+            pixel_data_size as usize,
+            &exr_header.channels,
+            channel_offset_list,
+            zfp,
+            as_tinyexr,
+            scratch,
+        );
+        tile.images = images;
+
+        if let Some((width, height)) = decoded {
+            (tile.width, tile.height) = (width, height);
+        } else {
+            error_flag |= EF_FAILED_TO_DECODE;
+        }
+
+        tile.offset_x = tile_coordinates[0];
+        tile.offset_y = tile_coordinates[1];
+        tile.level_x = tile_coordinates[2];
+        tile.level_y = tile_coordinates[3];
+    }
+
+    (tile, error_flag)
+}
+
+/// Checks whether a tile slot passes header validation enough to reach `allocate_image`.
+fn tile_will_allocate(
+    tile_idx: i32,
+    num_x_tiles: i32,
+    level_x: i32,
+    level_y: i32,
+    level_offsets: &[Vec<u64>],
+    head: &[u8],
+) -> bool {
+    let size = head.len();
+    let x_tile = tile_idx % num_x_tiles;
+    let y_tile = tile_idx / num_x_tiles;
+    let Some(&offset) = level_offsets
+        .get(y_tile as usize)
+        .and_then(|row| row.get(x_tile as usize))
+    else {
+        return false;
+    };
+    if offset.checked_add(20).is_none_or(|end| end > size as u64) {
+        return false;
+    }
+    let at = offset as usize;
+    let int_at = |p: usize| i32::from_le_bytes([head[p], head[p + 1], head[p + 2], head[p + 3]]);
+    if int_at(at + 8) != level_x || int_at(at + 12) != level_y {
+        return false;
+    }
+    let data_len = int_at(at + 16);
+    data_len >= 2 && (data_len as usize) <= size - (at + 20)
+}
+
 /// `DecodeTiledLevel`: the tiles of one level of a tiled image.
-// (Its parameters are tinyexr's, each a separate part of the state; one pass, step for step as
-// tinyexr's, its state shared throughout.)
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn decode_tiled_level(
     exr_image: &mut ExrImage,
@@ -91,11 +264,10 @@ fn decode_tiled_level(
     head: &[u8],
     zfp: Option<&ZfpParam>,
     as_tinyexr: bool,
+    remaining_tile_bytes: &mut usize,
+    threads: usize,
+    scratch: &mut DecodeScratch,
 ) -> Result<(), ExrError> {
-    const EF_INVALID_DATA: u32 = 1;
-    const EF_INSUFFICIENT_DATA: u32 = 2;
-    const EF_FAILED_TO_DECODE: u32 = 4;
-    let size = head.len();
     let num_channels = exr_header.channels.len() as i32;
 
     let level_index = level_index(
@@ -115,133 +287,170 @@ fn decode_tiled_level(
     if num_x_tiles < 1 {
         return Err(ErrorCode::INVALID_DATA.into());
     }
-    let num_tiles = num_x_tiles.wrapping_mul(num_y_tiles);
+    let Some(num_tiles) = num_x_tiles.checked_mul(num_y_tiles).filter(|&n| n >= 0) else {
+        return Err(ErrorCode::INVALID_DATA.into());
+    };
+
+    let bytes_per_tile =
+        decoded_bytes_per_pixel(&exr_header.channels, &exr_header.requested_pixel_types).and_then(
+            |bpp| {
+                let tx = usize::try_from(exr_header.tile_size_x).ok()?;
+                let ty = usize::try_from(exr_header.tile_size_y).ok()?;
+                tx.checked_mul(ty)?.checked_mul(bpp)
+            },
+        );
+    let types_are_valid = bytes_per_tile.is_some();
+
+    // Enforce total decoded tile memory cap before allocating tile channel buffers.
+    if let Some(tile_bytes) = bytes_per_tile {
+        let mut allocating_tiles = 0usize;
+        for tile_idx in 0..num_tiles {
+            if tile_will_allocate(
+                tile_idx,
+                num_x_tiles,
+                exr_image.level_x,
+                exr_image.level_y,
+                level_offsets,
+                head,
+            ) {
+                allocating_tiles += 1;
+            }
+        }
+        let Some(needed_bytes) = allocating_tiles.checked_mul(tile_bytes) else {
+            return Err(ExrError::new(
+                ErrorCode::INVALID_DATA,
+                "Tiled image data size is too large.\n",
+            ));
+        };
+        if needed_bytes > *remaining_tile_bytes {
+            return Err(ExrError::new(
+                ErrorCode::INVALID_DATA,
+                "Tiled image data size is too large.\n",
+            ));
+        }
+        *remaining_tile_bytes -= needed_bytes;
+    }
+
+    let level_x = exr_image.level_x;
+    let level_y = exr_image.level_y;
+    let level_width = exr_image.width;
+    let level_height = exr_image.height;
 
     let mut error_flag = 0u32;
 
-    // Although the spec says: "...the data window is subdivided into an array of smaller
-    // rectangles...", the IlmImf library allows the dimensions of the tile to be larger (or
-    // equal) than the dimensions of the data window.
+    #[cfg(feature = "std")]
+    if threads > 1 && num_tiles > 1 {
+        let total = num_tiles as usize;
+        let workers = threads.min(total);
+        let chunk_len = total.div_ceil(workers);
+        exr_image.tiles = vec![ExrTile::default(); total];
+        let mut flags = vec![0u32; workers];
 
-    // (The original gives every tile its memory before it looks at the tile, including the
-    // tiles it then finds wrong; a tile here is given its memory when it is found right.
-    // What comes back is the same: an image with a wrong tile is refused whole.)
-    let types_are_valid = allocate_image(
-        &exr_header.channels,
-        &exr_header.requested_pixel_types,
-        0,
-        0,
-    )
-    .is_some();
-    exr_image.tiles = Vec::new();
+        std::thread::scope(|s| {
+            let mut tile_chunks: Vec<&mut [ExrTile]> =
+                exr_image.tiles.chunks_mut(chunk_len).collect();
+            let actual_workers = tile_chunks.len();
+            let last_tiles = tile_chunks.pop().expect("at least one chunk");
+            let (last_flag, other_flags) = flags[..actual_workers]
+                .split_last_mut()
+                .expect("at least one flag");
 
-    for tile_idx in 0..num_tiles.max(0) {
-        let mut tile = ExrTile::default();
-        'tile: {
-            if !types_are_valid {
-                error_flag |= EF_INVALID_DATA;
-                break 'tile;
+            for (w_idx, (t_slice, f_slot)) in tile_chunks
+                .into_iter()
+                .zip(other_flags.iter_mut())
+                .enumerate()
+            {
+                let base_idx = (w_idx * chunk_len) as i32;
+                s.spawn(move || {
+                    let mut local_scratch = DecodeScratch::default();
+                    let mut local_flag = 0u32;
+                    for (k, slot) in t_slice.iter_mut().enumerate() {
+                        let (tile, f) = decode_one_tile(
+                            base_idx + k as i32,
+                            num_x_tiles,
+                            level_x,
+                            level_y,
+                            level_width,
+                            level_height,
+                            types_are_valid,
+                            exr_header,
+                            level_offsets,
+                            channel_offset_list,
+                            pixel_data_size,
+                            head,
+                            zfp,
+                            as_tinyexr,
+                            &mut local_scratch,
+                        );
+                        *slot = tile;
+                        local_flag |= f;
+                    }
+                    *f_slot = local_flag;
+                });
             }
 
-            // 16 byte: tile coordinates
-            // 4 byte : data size
-            // ~      : data(uncompressed or compressed)
-            let x_tile = tile_idx % num_x_tiles;
-            let y_tile = tile_idx / num_x_tiles;
-            // Seek to offset value in file.
-            let Some(&offset) = level_offsets
-                .get(y_tile as usize)
-                .and_then(|row| row.get(x_tile as usize))
-            else {
-                error_flag |= EF_INVALID_DATA;
-                break 'tile;
-            };
-            if offset.wrapping_add(4 * 5) > size as u64 {
-                // Insufficient data size.
-                error_flag |= EF_INSUFFICIENT_DATA;
-                break 'tile;
+            let last_base = ((actual_workers - 1) * chunk_len) as i32;
+            let mut local_flag = 0u32;
+            for (k, slot) in last_tiles.iter_mut().enumerate() {
+                let (tile, f) = decode_one_tile(
+                    last_base + k as i32,
+                    num_x_tiles,
+                    level_x,
+                    level_y,
+                    level_width,
+                    level_height,
+                    types_are_valid,
+                    exr_header,
+                    level_offsets,
+                    channel_offset_list,
+                    pixel_data_size,
+                    head,
+                    zfp,
+                    as_tinyexr,
+                    scratch,
+                );
+                *slot = tile;
+                local_flag |= f;
             }
+            *last_flag = local_flag;
+        });
 
-            let data_size = size - (offset as usize + 4 * 5);
-            let mut data_ptr = offset as usize;
-
-            let int_at = |at: usize| {
-                i32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]])
-            };
-            let tile_coordinates = [
-                int_at(data_ptr),
-                int_at(data_ptr + 4),
-                int_at(data_ptr + 8),
-                int_at(data_ptr + 12),
-            ];
-
-            if tile_coordinates[2] != exr_image.level_x {
-                // Invalid data.
-                error_flag |= EF_INVALID_DATA;
-                break 'tile;
-            }
-            if tile_coordinates[3] != exr_image.level_y {
-                // Invalid data.
-                error_flag |= EF_INVALID_DATA;
-                break 'tile;
-            }
-
-            let data_len = int_at(data_ptr + 16);
-
-            if data_len < 2 || data_len as usize > data_size {
-                // Insufficient data size.
-                error_flag |= EF_INSUFFICIENT_DATA;
-                break 'tile;
-            }
-
-            // Move to data addr: 20 = 16 + 4;
-            data_ptr += 20;
-            let Some(mut images) = allocate_image(
-                &exr_header.channels,
-                &exr_header.requested_pixel_types,
-                exr_header.tile_size_x,
-                exr_header.tile_size_y,
-            ) else {
-                error_flag |= EF_INVALID_DATA;
-                break 'tile;
-            };
-            let size = decode_tiled_pixel_data(
-                &mut images,
-                &exr_header.requested_pixel_types,
-                &head[data_ptr..],
-                data_len as usize,
-                exr_header.compression_type,
-                exr_image.width,
-                exr_image.height,
-                tile_coordinates[0],
-                tile_coordinates[1],
-                exr_header.tile_size_x,
-                exr_header.tile_size_y,
-                pixel_data_size as usize,
-                &exr_header.channels,
-                channel_offset_list,
-                zfp,
-                as_tinyexr,
-            );
-            tile.images = images;
-
-            if let Some((width, height)) = size {
-                (tile.width, tile.height) = (width, height);
-            } else {
-                // Failed to decode tile data.
-                error_flag |= EF_FAILED_TO_DECODE;
-            }
-
-            tile.offset_x = tile_coordinates[0];
-            tile.offset_y = tile_coordinates[1];
-            tile.level_x = tile_coordinates[2];
-            tile.level_y = tile_coordinates[3];
+        for f in flags {
+            error_flag |= f;
         }
+        exr_image.num_channels = num_channels;
+        return finish_tiled_level(error_flag);
+    }
+
+    let _ = threads;
+    exr_image.tiles = Vec::with_capacity(num_tiles as usize);
+    for tile_idx in 0..num_tiles {
+        let (tile, f) = decode_one_tile(
+            tile_idx,
+            num_x_tiles,
+            level_x,
+            level_y,
+            level_width,
+            level_height,
+            types_are_valid,
+            exr_header,
+            level_offsets,
+            channel_offset_list,
+            pixel_data_size,
+            head,
+            zfp,
+            as_tinyexr,
+            scratch,
+        );
+        error_flag |= f;
         exr_image.tiles.push(tile);
     }
 
     exr_image.num_channels = num_channels;
+    finish_tiled_level(error_flag)
+}
 
+fn finish_tiled_level(error_flag: u32) -> Result<(), ExrError> {
     if error_flag == 0 {
         return Ok(());
     }
@@ -255,15 +464,107 @@ fn decode_tiled_level(
     Err(ExrError::new(ErrorCode::INVALID_DATA, message))
 }
 
+/// Pre-validated scanline chunk descriptor for safe parallel row-band decoding.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+struct ScanlineChunkMeta {
+    data_ptr: usize,
+    data_len: usize,
+    num_lines: i32,
+}
+
+/// Checks whether all scanline blocks form clean, sequential, non-overlapping bands from top
+/// to bottom (`0..data_height`) with `1x1` channel sampling, enabling zero-copy parallel
+/// decoding directly into disjoint slices of `exr_image.images`.
+#[cfg(feature = "std")]
+fn precheck_parallel_scanlines(
+    offsets: &[u64],
+    head: &[u8],
+    exr_header: &ExrHeader,
+    num_scanline_blocks: i32,
+    data_height: i32,
+) -> Option<Vec<ScanlineChunkMeta>> {
+    if exr_header
+        .channels
+        .iter()
+        .any(|ch| ch.x_sampling > 1 || ch.y_sampling > 1)
+    {
+        return None;
+    }
+    let size = head.len();
+    let expected_blocks = ((i64::from(data_height) + i64::from(num_scanline_blocks) - 1)
+        / i64::from(num_scanline_blocks)) as usize;
+    if offsets.len() != expected_blocks {
+        return None;
+    }
+
+    let mut metas = Vec::with_capacity(offsets.len());
+    for (b, &offset) in offsets.iter().enumerate() {
+        if offset.checked_add(8).is_none_or(|end| end > size as u64) {
+            return None;
+        }
+        let ptr = offset as usize;
+        let line_no = i32::from_le_bytes([head[ptr], head[ptr + 1], head[ptr + 2], head[ptr + 3]]);
+        let data_len =
+            i32::from_le_bytes([head[ptr + 4], head[ptr + 5], head[ptr + 6], head[ptr + 7]]);
+        let data_size = size - (ptr + 8);
+        if data_len <= 0
+            || (data_len as usize) > data_size
+            || !(-(2 << 20)..=(2 << 20)).contains(&line_no)
+        {
+            return None;
+        }
+        let end_line_no = line_no
+            .wrapping_add(num_scanline_blocks)
+            .min(exr_header.data_window.max_y.wrapping_add(1));
+        let num_lines = end_line_no.wrapping_sub(line_no);
+        if num_lines <= 0 {
+            return None;
+        }
+        let lno = i64::from(line_no) - i64::from(exr_header.data_window.min_y);
+        let expected_lno = (b as i64) * i64::from(num_scanline_blocks);
+        let expected_lines = (expected_lno + i64::from(num_scanline_blocks))
+            .min(i64::from(data_height))
+            - expected_lno;
+        if lno != expected_lno || i64::from(num_lines) != expected_lines {
+            return None;
+        }
+        metas.push(ScanlineChunkMeta {
+            data_ptr: ptr + 8,
+            data_len: data_len as usize,
+            num_lines,
+        });
+    }
+    Some(metas)
+}
+
 /// `DecodeChunk`: every block of the file `head` into `exr_image`.
-// (One pass, step for step as tinyexr's, its state shared throughout.)
-#[allow(clippy::too_many_lines)]
 pub(super) fn decode_chunk(
     exr_header: &mut ExrHeader,
     offset_data: &OffsetData,
     head: &[u8],
     as_tinyexr: bool,
 ) -> Result<ExrImage, ExrError> {
+    decode_chunk_with_threads(exr_header, offset_data, head, as_tinyexr, 1)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn decode_chunk_with_threads(
+    exr_header: &mut ExrHeader,
+    offset_data: &OffsetData,
+    head: &[u8],
+    as_tinyexr: bool,
+    num_threads: usize,
+) -> Result<ExrImage, ExrError> {
+    if exr_header.requested_pixel_types.len() != exr_header.channels.len() {
+        return Err(ExrError::new(
+            ErrorCode::INVALID_ARGUMENT,
+            "requested_pixel_types length must match channels length.\n",
+        ));
+    }
+
+    let threads = effective_threads(num_threads);
+    let mut scratch = DecodeScratch::default();
     let mut exr_image = ExrImage::default();
     let size = head.len();
     let num_channels = exr_header.channels.len() as i32;
@@ -271,9 +572,19 @@ pub(super) fn decode_chunk(
     let num_scanline_blocks = num_scanline_blocks(exr_header.compression_type, as_tinyexr);
 
     let zfp = if exr_header.compression_type == Compression::ZFP {
-        let param = find_zfp_compression_param(&exr_header.custom_attributes)
-            .map_err(|message| ExrError::new(ErrorCode::INVALID_HEADER, message))?;
-        Some(param)
+        #[cfg(not(feature = "zfp"))]
+        {
+            return Err(ExrError::new(
+                ErrorCode::UNSUPPORTED_FEATURE,
+                "ZFP compression requires the `zfp` Cargo feature.\n",
+            ));
+        }
+        #[cfg(feature = "zfp")]
+        {
+            let param = find_zfp_compression_param(&exr_header.custom_attributes)
+                .map_err(|message| ExrError::new(ErrorCode::INVALID_HEADER, message))?;
+            Some(param)
+        }
     } else {
         None
     };
@@ -306,7 +617,6 @@ pub(super) fn decode_chunk(
         ));
     }
 
-    // Do not allow too large data_width and data_height. header invalid?
     {
         if data_width > DIMENSION_THRESHOLD || data_height > DIMENSION_THRESHOLD {
             return Err(ExrError::new(
@@ -330,8 +640,6 @@ pub(super) fn decode_chunk(
         }
     }
 
-    // (For a tiled file whose table has no level, the original reads a table that is not
-    // there; it is not used for a tiled file.)
     let no_offsets = Vec::new();
     let offsets = offset_data
         .offsets
@@ -351,7 +659,6 @@ pub(super) fn decode_chunk(
     let mut invalid_data = false;
 
     if exr_header.tiled {
-        // value check
         if exr_header.tile_size_x < 0 {
             return Err(ExrError::new(
                 ErrorCode::INVALID_HEADER,
@@ -375,7 +682,6 @@ pub(super) fn decode_chunk(
             .max_y
             .wrapping_sub(exr_header.data_window.min_y)
             .wrapping_add(1);
-        // The levels, in the order of the file: (level x, level y) of each.
         let mut levels = Vec::new();
         if exr_header.tile_level_mode == TileLevelMode::RIPMAP_LEVELS {
             for level_y in 0..offset_data.num_y_levels {
@@ -388,11 +694,12 @@ pub(super) fn decode_chunk(
                 levels.push((level, level));
             }
         }
-        // (The original chains the levels as it goes; here they are chained at the end.)
+
+        let mut remaining_tile_bytes = MAX_TILED_IMAGE_BYTES;
         let mut decoded = Vec::with_capacity(levels.len());
         for (i, &(level_x, level_y)) in levels.iter().enumerate() {
             let mut level_image = if i == 0 {
-                std::mem::take(&mut exr_image)
+                core::mem::take(&mut exr_image)
             } else {
                 ExrImage::default()
             };
@@ -416,18 +723,20 @@ pub(super) fn decode_chunk(
                 head,
                 zfp.as_ref(),
                 as_tinyexr,
+                &mut remaining_tile_bytes,
+                threads,
+                &mut scratch,
             )?;
             decoded.push(level_image);
         }
         if let Some(first) = decoded.into_iter().rev().reduce(|next, mut level| {
-            level.next_level = Some(Box::new(next));
+            level.next_level = Some(alloc::boxed::Box::new(next));
             level
         }) {
             exr_image = first;
         }
     } else {
         // scanline format
-        // Don't allow too large image(256GB * pixel_data_size or more). Workaround for #104.
         let total_data_len = (data_width as u64)
             .wrapping_mul(data_height as u64)
             .wrapping_mul(num_channels as u64);
@@ -456,78 +765,202 @@ pub(super) fn decode_chunk(
         };
         exr_image.images = images;
 
-        for y in 0..num_blocks as i32 {
-            let y_idx = y as usize;
+        #[cfg(feature = "std")]
+        let mut ran_parallel = false;
+        #[cfg(feature = "std")]
+        if threads > 1
+            && num_blocks > 1
+            && let Some(metas) = precheck_parallel_scanlines(
+                offsets,
+                head,
+                exr_header,
+                num_scanline_blocks,
+                data_height as i32,
+            )
+        {
+            ran_parallel = true;
+            let workers = threads.min(num_blocks);
+            let blocks_per_worker = num_blocks.div_ceil(workers);
+            let width_usize = data_width as usize;
 
-            if offsets[y_idx].wrapping_add(4 * 2) > size as u64 {
-                invalid_data = true;
-            } else {
-                // 4 byte: scan line
-                // 4 byte: data size
-                // ~     : pixel data(uncompressed or compressed)
-                let data_size = size - (offsets[y_idx] as usize + 4 * 2);
-                let mut data_ptr = offsets[y_idx] as usize;
+            let mut full_views: Vec<ChannelViewMut<'_>> = exr_image
+                .images
+                .iter_mut()
+                .map(ChannelData::as_view_mut)
+                .collect();
+            let mut worker_views: Vec<(usize, usize, i32, Vec<ChannelViewMut<'_>>)> =
+                Vec::with_capacity(workers);
 
-                let int_at = |at: usize| {
-                    i32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]])
-                };
-                let mut line_no = int_at(data_ptr);
-                let data_len = int_at(data_ptr + 4);
+            let mut b0 = 0usize;
+            while b0 < num_blocks {
+                let b1 = (b0 + blocks_per_worker).min(num_blocks);
+                let rows_in_band: i32 = metas[b0..b1].iter().map(|m| m.num_lines).sum();
+                let elems = (rows_in_band as usize) * width_usize;
+                let band_views: Vec<ChannelViewMut<'_>> =
+                    full_views.iter_mut().map(|v| v.take_front(elems)).collect();
+                worker_views.push((b0, b1, rows_in_band, band_views));
+                b0 = b1;
+            }
 
-                if data_len as isize as usize > data_size {
-                    invalid_data = true;
-                } else if !(-(2 << 20)..=(2 << 20)).contains(&line_no) {
-                    // Too large value for line_no (2M+ lines).
-                    invalid_data = true;
-                } else if data_len == 0 {
-                    // TODO(syoyo): May be ok to raise the threshold for example `data_len < 4`
-                    invalid_data = true;
-                } else {
-                    // line_no may be negative.
-                    let end_line_no = line_no
-                        .wrapping_add(num_scanline_blocks)
-                        .min(exr_header.data_window.max_y.wrapping_add(1));
+            let actual_workers = worker_views.len();
+            let mut worker_ok = vec![true; actual_workers];
 
-                    let num_lines = end_line_no.wrapping_sub(line_no);
+            std::thread::scope(|s| {
+                let (_, _, last_rows, mut last_views) =
+                    worker_views.pop().expect("at least one worker");
+                let last_b0 = (actual_workers - 1) * blocks_per_worker;
+                let (last_ok, other_ok) = worker_ok.split_last_mut().expect("at least one status");
 
-                    if num_lines <= 0 {
-                        invalid_data = true;
-                    } else {
-                        // Move to data addr: 8 = 4 + 4;
-                        data_ptr += 8;
-
-                        // Adjust line_no with data_window.bmin.y
-
-                        // overflow check
-                        let lno = i64::from(line_no) - i64::from(exr_header.data_window.min_y);
-                        line_no = if lno.abs() > i64::from(i32::MAX) {
-                            -1
-                        } else {
-                            lno as i32
-                        };
-
-                        if line_no < 0
-                            || !decode_pixel_data(
-                                &mut exr_image.images,
-                                &exr_header.requested_pixel_types,
-                                &head[data_ptr..],
-                                data_len as usize,
-                                exr_header.compression_type,
+                for ((wb0, wb1, w_rows, mut w_views), ok_slot) in
+                    worker_views.into_iter().zip(other_ok.iter_mut())
+                {
+                    let meta_slice = &metas[wb0..wb1];
+                    let requested = &exr_header.requested_pixel_types;
+                    let channels = &exr_header.channels;
+                    let ch_offsets = &channel_offset_list;
+                    let comp = exr_header.compression_type;
+                    let zfp_ref = zfp.as_ref();
+                    s.spawn(move || {
+                        let mut local_scratch = DecodeScratch::default();
+                        let mut ok = true;
+                        for (local_b, meta) in meta_slice.iter().enumerate() {
+                            let local_line = (local_b as i32) * num_scanline_blocks;
+                            if !decode_pixel_data_with_scratch(
+                                &mut w_views,
+                                requested,
+                                &head[meta.data_ptr..],
+                                meta.data_len,
+                                comp,
                                 LineOrder::INCREASING_Y,
                                 data_width as i32,
-                                data_height as i32,
+                                w_rows,
                                 data_width as i32,
-                                y,
-                                line_no,
-                                num_lines,
+                                local_b as i32,
+                                local_line,
+                                meta.num_lines,
                                 pixel_data_size as usize,
-                                &exr_header.channels,
-                                &channel_offset_list,
-                                zfp.as_ref(),
+                                channels,
+                                ch_offsets,
+                                zfp_ref,
                                 as_tinyexr,
-                            )
-                        {
+                                &mut local_scratch,
+                            ) {
+                                ok = false;
+                            }
+                        }
+                        *ok_slot = ok;
+                    });
+                }
+
+                let mut ok = true;
+                for (local_b, meta) in metas[last_b0..].iter().enumerate() {
+                    let local_line = (local_b as i32) * num_scanline_blocks;
+                    if !decode_pixel_data_with_scratch(
+                        &mut last_views,
+                        &exr_header.requested_pixel_types,
+                        &head[meta.data_ptr..],
+                        meta.data_len,
+                        exr_header.compression_type,
+                        LineOrder::INCREASING_Y,
+                        data_width as i32,
+                        last_rows,
+                        data_width as i32,
+                        local_b as i32,
+                        local_line,
+                        meta.num_lines,
+                        pixel_data_size as usize,
+                        &exr_header.channels,
+                        &channel_offset_list,
+                        zfp.as_ref(),
+                        as_tinyexr,
+                        &mut scratch,
+                    ) {
+                        ok = false;
+                    }
+                }
+                *last_ok = ok;
+            });
+
+            if worker_ok.into_iter().any(|ok| !ok) {
+                invalid_data = true;
+            }
+        }
+
+        #[cfg(not(feature = "std"))]
+        let ran_parallel = false;
+
+        if !ran_parallel {
+            let mut views: Vec<ChannelViewMut<'_>> = exr_image
+                .images
+                .iter_mut()
+                .map(ChannelData::as_view_mut)
+                .collect();
+
+            for y in 0..num_blocks as i32 {
+                let y_idx = y as usize;
+
+                if offsets[y_idx]
+                    .checked_add(8)
+                    .is_none_or(|end| end > size as u64)
+                {
+                    invalid_data = true;
+                } else {
+                    let data_size = size - (offsets[y_idx] as usize + 8);
+                    let mut data_ptr = offsets[y_idx] as usize;
+
+                    let int_at = |at: usize| {
+                        i32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]])
+                    };
+                    let mut line_no = int_at(data_ptr);
+                    let data_len = int_at(data_ptr + 4);
+
+                    if data_len as isize as usize > data_size
+                        || !(-(2 << 20)..=(2 << 20)).contains(&line_no)
+                        || data_len == 0
+                    {
+                        invalid_data = true;
+                    } else {
+                        let end_line_no = line_no
+                            .wrapping_add(num_scanline_blocks)
+                            .min(exr_header.data_window.max_y.wrapping_add(1));
+
+                        let num_lines = end_line_no.wrapping_sub(line_no);
+
+                        if num_lines <= 0 {
                             invalid_data = true;
+                        } else {
+                            data_ptr += 8;
+                            let lno = i64::from(line_no) - i64::from(exr_header.data_window.min_y);
+                            line_no = if lno.abs() > i64::from(i32::MAX) {
+                                -1
+                            } else {
+                                lno as i32
+                            };
+
+                            if line_no < 0
+                                || !decode_pixel_data_with_scratch(
+                                    &mut views,
+                                    &exr_header.requested_pixel_types,
+                                    &head[data_ptr..],
+                                    data_len as usize,
+                                    exr_header.compression_type,
+                                    LineOrder::INCREASING_Y,
+                                    data_width as i32,
+                                    data_height as i32,
+                                    data_width as i32,
+                                    y,
+                                    line_no,
+                                    num_lines,
+                                    pixel_data_size as usize,
+                                    &exr_header.channels,
+                                    &channel_offset_list,
+                                    zfp.as_ref(),
+                                    as_tinyexr,
+                                    &mut scratch,
+                                )
+                            {
+                                invalid_data = true;
+                            }
                         }
                     }
                 }
@@ -542,17 +975,13 @@ pub(super) fn decode_chunk(
         ));
     }
 
-    // Overwrite `pixel_type` with `requested_pixel_type`.
     exr_header
         .pixel_types
         .clone_from(&exr_header.requested_pixel_types);
 
-    {
-        exr_image.num_channels = num_channels;
-
-        exr_image.width = data_width as i32;
-        exr_image.height = data_height as i32;
-    }
+    exr_image.num_channels = num_channels;
+    exr_image.width = data_width as i32;
+    exr_image.height = data_height as i32;
 
     Ok(exr_image)
 }
@@ -567,7 +996,6 @@ fn reconstruct_line_offsets(offsets: &mut [u64], head: &[u8], mut marker: usize)
 
     for offset_slot in offsets.iter_mut() {
         let offset = marker;
-        // Offset should not exceed whole EXR file/data size.
         if offset.checked_add(8).is_none_or(|end| end >= size) {
             return false;
         }
@@ -583,16 +1011,18 @@ fn reconstruct_line_offsets(offsets: &mut [u64], head: &[u8], mut marker: usize)
             return false;
         }
 
-        *offset_slot = offset as u64;
+        let Some(next) = marker.checked_add(8).and_then(|m| m.checked_add(data_len)) else {
+            return false;
+        };
 
-        marker += data_len + 8; // 8 = 4 bytes(y) + 4 bytes(data_len)
+        *offset_slot = offset as u64;
+        marker = next;
     }
 
     true
 }
 
 fn floor_log2(mut x: u32) -> i32 {
-    // For x > 0, floorLog2(y) returns floor(log(x)/log(2)).
     let mut y = 0;
     while x > 1 {
         y += 1;
@@ -602,14 +1032,12 @@ fn floor_log2(mut x: u32) -> i32 {
 }
 
 fn ceil_log2(mut x: u32) -> i32 {
-    // For x > 0, ceilLog2(y) returns ceil(log(x)/log(2)).
     let mut y = 0;
     let mut r = 0;
     while x > 1 {
         if x & 1 != 0 {
             r = 1;
         }
-
         y += 1;
         x >>= 1;
     }
@@ -679,7 +1107,6 @@ fn calculate_num_tiles(
             return false;
         }
         if size <= 0 {
-            // (A tile size of 0 has the original divide by it.)
             return false;
         }
         if l > i32::MAX - size + 1 {
@@ -737,9 +1164,7 @@ pub(super) fn precalculate_tile_info(exr_header: &ExrHeader) -> Option<(Vec<i32>
     Some((num_x_tiles, num_y_tiles))
 }
 
-/// The shape of the offset table of a tiled file (`InitTileOffsets`): for each level, how
-/// many rows of tiles it has and how many tiles a row. The second answer is the number of
-/// tiles in all, as the original counts it.
+/// The shape of the offset table of a tiled file (`InitTileOffsets`).
 pub(super) fn tile_offsets_shape(
     offset_data: &mut OffsetData,
     exr_header: &ExrHeader,
@@ -874,8 +1299,16 @@ fn is_valid_tile(
         TileLevelMode::ONE_LEVEL => lx == 0 && ly == 0 && has(0),
         TileLevelMode::MIPMAP_LEVELS => lx < num_x_levels && ly < num_y_levels && has(lx as usize),
         TileLevelMode::RIPMAP_LEVELS => {
-            let idx = lx as usize + ly as usize * num_x_levels as usize;
-            lx < num_x_levels && ly < num_y_levels && has(idx)
+            if lx >= num_x_levels || ly >= num_y_levels {
+                return false;
+            }
+            let Some(idx) = (ly as usize)
+                .checked_mul(num_x_levels as usize)
+                .and_then(|n| n.checked_add(lx as usize))
+            else {
+                return false;
+            };
+            has(idx)
         }
         _ => false,
     }
@@ -893,25 +1326,18 @@ fn reconstruct_tile_offsets(
 ) -> bool {
     let size = head.len();
     let num_x_levels = offset_data.num_x_levels;
-    let count: usize = offset_data
-        .offsets
-        .iter()
-        .flatten()
-        .map(std::vec::Vec::len)
-        .sum();
+    let count: usize = offset_data.offsets.iter().flatten().map(Vec::len).sum();
     for _ in 0..count {
         let tile_offset = marker as u64;
 
         if is_multi_part_file {
-            if marker + 4 >= size {
+            if marker.checked_add(4).is_none_or(|end| end >= size) {
                 return false;
             }
-
-            // int partNumber;
             marker += 4;
         }
 
-        if marker + 4 * 4 >= size {
+        if marker.checked_add(16).is_none_or(|end| end >= size) {
             return false;
         }
 
@@ -930,7 +1356,7 @@ fn reconstruct_tile_offsets(
         marker += 4;
 
         if is_deep {
-            if marker + 2 * 8 >= size {
+            if marker.checked_add(16).is_none_or(|end| end >= size) {
                 return false;
             }
             let long_at = |at: usize| {
@@ -944,30 +1370,35 @@ fn reconstruct_tile_offsets(
             let packed_sample_size = long_at(marker);
             marker += 8;
 
-            // next Int64 is unpacked sample size - skip that too
-            // (Sizes that take the place before the file, where the original then reads,
-            // are refused.)
-            let next = (marker as i64)
-                .wrapping_add(packed_offset_table_size)
-                .wrapping_add(packed_sample_size)
-                .wrapping_add(8);
+            let Some(next) = (marker as i64)
+                .checked_add(packed_offset_table_size)
+                .and_then(|v| v.checked_add(packed_sample_size))
+                .and_then(|v| v.checked_add(8))
+            else {
+                return false;
+            };
             if next < 0 || next as u64 >= size as u64 {
                 return false;
             }
-            marker = next as usize;
+            let Ok(next_usize) = usize::try_from(next) else {
+                return false;
+            };
+            marker = next_usize;
         } else {
-            if marker + 4 >= size {
+            if marker.checked_add(4).is_none_or(|end| end >= size) {
                 return false;
             }
 
-            let data_size = int_at(marker) as u32;
+            let data_size = int_at(marker) as u32 as usize;
             marker += 4;
 
-            marker += data_size as usize;
-
-            if marker >= size {
+            let Some(next) = marker.checked_add(data_size) else {
+                return false;
+            };
+            if next >= size {
                 return false;
             }
+            marker = next;
         }
 
         if !is_valid_tile(exr_header, offset_data, tile_x, tile_y, level_x, level_y) {
@@ -993,8 +1424,7 @@ fn reconstruct_tile_offsets(
     true
 }
 
-/// One entry of an offset table, at `*marker` (`ReadOffsets`, and the same lines of
-/// `DecodeEXRImage` for a file of scanlines).
+/// One entry of an offset table, at `*marker`.
 fn read_offset(head: &[u8], marker: &mut usize) -> Result<u64, ExrError> {
     let size = head.len();
     let fail = |message: &str| Err(ExrError::new(ErrorCode::INVALID_DATA, message));
@@ -1014,13 +1444,13 @@ fn read_offset(head: &[u8], marker: &mut usize) -> Result<u64, ExrError> {
 }
 
 /// `DecodeEXRImage`: the pixels of the file `head`, whose offset table starts at `marker`.
-// (One pass, step for step as tinyexr's, its state shared throughout.)
 #[allow(clippy::too_many_lines)]
-pub(crate) fn decode_exr_image(
+pub(crate) fn decode_exr_image_with_threads(
     exr_header: &mut ExrHeader,
     head: &[u8],
     mut marker: usize,
     as_tinyexr: bool,
+    num_threads: usize,
 ) -> Result<ExrImage, ExrError> {
     let size = head.len();
     let fail = |message: &str| Err(ExrError::new(ErrorCode::INVALID_DATA, message));
@@ -1028,6 +1458,12 @@ pub(crate) fn decode_exr_image(
         return Err(ExrError::new(
             ErrorCode::INVALID_ARGUMENT,
             "Invalid argument for DecodeEXRImage().",
+        ));
+    }
+    if exr_header.requested_pixel_types.len() != exr_header.channels.len() {
+        return Err(ExrError::new(
+            ErrorCode::INVALID_ARGUMENT,
+            "requested_pixel_types length must match channels length.\n",
         ));
     }
 
@@ -1040,7 +1476,6 @@ pub(crate) fn decode_exr_image(
             .wrapping_sub(exr_header.data_window.min_x)
             == i32::MAX
     {
-        // Issue 63
         return fail("Invalid data width value");
     }
     let data_width =
@@ -1066,14 +1501,11 @@ pub(crate) fn decode_exr_image(
         return fail("Invalid data window height value");
     }
 
-    // Do not allow too large data_width and data_height. header invalid?
-    {
-        if data_width > DIMENSION_THRESHOLD {
-            return fail("data width too large.");
-        }
-        if data_height > DIMENSION_THRESHOLD {
-            return fail("data height too large.");
-        }
+    if data_width > DIMENSION_THRESHOLD {
+        return fail("data width too large.");
+    }
+    if data_height > DIMENSION_THRESHOLD {
+        return fail("data height too large.");
     }
 
     if exr_header.tiled {
@@ -1085,7 +1517,6 @@ pub(crate) fn decode_exr_image(
         }
     }
 
-    // Read offset tables.
     let mut offset_data = OffsetData::default();
     if exr_header.tiled {
         let Some((num_x_tiles, num_y_tiles)) = precalculate_tile_info(exr_header) else {
@@ -1097,8 +1528,6 @@ pub(crate) fn decode_exr_image(
             return fail("Invalid offset table size.");
         }
 
-        // `ReadOffsets`. (The original makes the whole table first; here a table larger
-        // than the file can hold stops where the file does.)
         for &(rows, columns) in &shape {
             let mut level = Vec::new();
             for _dy in 0..rows {
@@ -1124,17 +1553,11 @@ pub(crate) fn decode_exr_image(
         }
     } else {
         let num_blocks = if exr_header.chunk_count > 0 {
-            // Use `chunkCount` attribute.
             exr_header.chunk_count as usize
         } else {
-            let mut num_blocks = data_height as usize / num_scanline_blocks as usize;
-            if num_blocks * (num_scanline_blocks as usize) < data_height as usize {
-                num_blocks += 1;
-            }
-            num_blocks
+            (data_height as usize).div_ceil(num_scanline_blocks as usize)
         };
 
-        // `InitSingleResolutionOffsets`.
         offset_data.num_x_levels = 1;
         offset_data.num_y_levels = 1;
 
@@ -1143,16 +1566,13 @@ pub(crate) fn decode_exr_image(
             offsets.push(read_offset(head, &mut marker)?);
         }
 
-        // If line offsets are invalid, we try to reconstruct it.
-        // See OpenEXR/IlmImf/ImfScanLineInputFile.cpp::readLineOffsets() for details.
-        if offsets.iter().any(|&offset| offset as i64 <= 0) {
-            // TODO(syoyo) Report as warning?
-            if !reconstruct_line_offsets(&mut offsets, head, marker) {
-                return fail("Cannot reconstruct lineOffset table in DecodeEXRImage.");
-            }
+        if offsets.iter().any(|&offset| offset as i64 <= 0)
+            && !reconstruct_line_offsets(&mut offsets, head, marker)
+        {
+            return fail("Cannot reconstruct lineOffset table in DecodeEXRImage.");
         }
         offset_data.offsets = vec![vec![offsets]];
     }
 
-    decode_chunk(exr_header, &offset_data, head, as_tinyexr)
+    decode_chunk_with_threads(exr_header, &offset_data, head, as_tinyexr, num_threads)
 }

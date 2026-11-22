@@ -23,17 +23,22 @@
 
 mod made_up;
 
-#[test]
-fn writes_as_tinyexr_does() {
-    // (And reads each file back: what was stored as it was comes back as it was.)
-    let printed = made_up::tinyexr_write("tinyexr_write_small", 5, 300);
-    let expected = include_str!("data/tinyexr_write_expected.txt");
+fn assert_lines_eq(printed: &str, expected: &str) {
     for (line, (ours, theirs)) in printed.lines().zip(expected.lines()).enumerate() {
         assert_eq!(ours, theirs, "line {}", line + 1);
     }
     assert_eq!(printed.lines().count(), expected.lines().count());
 }
 
+#[cfg(feature = "zfp")]
+#[test]
+fn writes_as_tinyexr_does() {
+    // (And reads each file back: what was stored as it was comes back as it was.)
+    let printed = made_up::tinyexr_write("tinyexr_write_small", 5, 300);
+    assert_lines_eq(&printed, include_str!("data/tinyexr_write_expected.txt"));
+}
+
+#[cfg(feature = "zfp")]
 #[test]
 fn reads_as_tinyexr_does() {
     let printed = made_up::tinyexr_read(
@@ -41,33 +46,34 @@ fn reads_as_tinyexr_does() {
         100,
         include_bytes!("data/exr_files.bin"),
     );
-    let expected = include_str!("data/tinyexr_read_expected.txt");
-    for (line, (ours, theirs)) in printed.lines().zip(expected.lines()).enumerate() {
-        assert_eq!(ours, theirs, "line {}", line + 1);
-    }
-    assert_eq!(printed.lines().count(), expected.lines().count());
+    assert_lines_eq(&printed, include_str!("data/tinyexr_read_expected.txt"));
 }
 
+#[cfg(feature = "zfp")]
 #[test]
 fn zfp_is_written_and_read_as_tinyexr_does() {
     let printed = made_up::tinyexr_write("tinyexr_zfp_write", 5, 300);
-    assert_eq!(printed, include_str!("data/tinyexr_zfp_write_expected.txt"));
+    assert_lines_eq(
+        &printed,
+        include_str!("data/tinyexr_zfp_write_expected.txt"),
+    );
     let printed =
         made_up::tinyexr_read("tinyexr_zfp_read", 100, include_bytes!("data/exr_zfp.bin"));
-    assert_eq!(printed, include_str!("data/tinyexr_zfp_read_expected.txt"));
+    assert_lines_eq(&printed, include_str!("data/tinyexr_zfp_read_expected.txt"));
 }
 
+#[cfg(feature = "zfp")]
 #[test]
 fn files_of_many_parts_are_written_and_read_as_tinyexr_does() {
     let printed =
         made_up::tinyexr_parts("tinyexr_parts", 7, 60, include_bytes!("data/exr_parts.bin"));
-    assert_eq!(printed, include_str!("data/tinyexr_parts_expected.txt"));
+    assert_lines_eq(&printed, include_str!("data/tinyexr_parts_expected.txt"));
 }
 
 #[test]
 fn deep_files_are_read_as_tinyexr_does() {
     let printed = made_up::tinyexr_deep("tinyexr_deep", 80, include_bytes!("data/exr_deep.bin"));
-    assert_eq!(printed, include_str!("data/tinyexr_deep_expected.txt"));
+    assert_lines_eq(&printed, include_str!("data/tinyexr_deep_expected.txt"));
 }
 
 /// Files of many parts and deep files damaged far worse than the comparison's: whatever is in

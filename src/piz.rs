@@ -5,6 +5,23 @@
 //! The 16-bit values of a block go through a table that closes the gaps between the values
 //! that occur, then through a wavelet transform, and what comes out is Huffman coded.
 
+use alloc::{vec, vec::Vec};
+
+/// Reusable working buffers for PIZ compression and decompression, avoiding ~1.3–2.0 MB of
+/// allocations per 32-scanline block.
+#[derive(Default)]
+pub(crate) struct PizScratch {
+    bitmap: Vec<u8>,
+    lut: Vec<u16>,
+    tmp_buffer: Vec<u16>,
+    freq: Vec<i64>,
+    hdec: Vec<HufDec>,
+    hlink: Vec<i32>,
+    f_heap: Vec<usize>,
+    scode: Vec<i64>,
+    out: Vec<u8>,
+}
+
 /// `wenc14`: the wavelet's step for values under 2^14: an average and a difference.
 #[inline]
 fn wenc14(a: u16, b: u16) -> (u16, u16) {
@@ -65,7 +82,7 @@ fn wdec16(l: u16, h: u16) -> (u16, u16) {
 
 /// `wav2Encode`: the two-dimensional wavelet transform of `nx` by `ny` values in place,
 /// `ox` and `oy` apart in `data`. `mx` is the largest value there is.
-pub(crate) fn wav2_encode(data: &mut [u16], nx: i32, ox: i32, ny: i32, oy: i32, mx: u16) {
+pub(crate) fn wav2_encode(data: &mut [u16], nx: i32, ox: usize, ny: i32, oy: usize, mx: u16) {
     let w14 = i32::from(mx) < (1 << 14);
     let enc = |a: u16, b: u16| if w14 { wenc14(a, b) } else { wenc16(a, b) };
 
@@ -133,7 +150,7 @@ pub(crate) fn wav2_encode(data: &mut [u16], nx: i32, ox: i32, ny: i32, oy: i32, 
 }
 
 /// `wav2Decode`: the transform undone.
-pub(crate) fn wav2_decode(data: &mut [u16], nx: i32, ox: i32, ny: i32, oy: i32, mx: u16) {
+pub(crate) fn wav2_decode(data: &mut [u16], nx: i32, ox: usize, ny: i32, oy: usize, mx: u16) {
     let w14 = i32::from(mx) < (1 << 14);
     let dec = |l: u16, h: u16| if w14 { wdec14(l, h) } else { wdec16(l, h) };
 
@@ -269,9 +286,6 @@ impl BitWriter<'_> {
     /// `sendCode`: a symbol and how many more times it comes, as a run where that is shorter.
     #[inline]
     fn send_code(&mut self, s_code: i64, mut run_count: i32, run_code: i64) {
-        // Output a run of runCount instances of the symbol sCount. Output the symbols
-        // explicitly, or if that is shorter, output the sCode symbol once followed by a
-        // runCode symbol and runCount expressed as an 8-bit number.
         if huf_length(s_code) + huf_length(run_code) + 8 < huf_length(s_code) * i64::from(run_count)
         {
             self.output_code(s_code);
@@ -322,14 +336,10 @@ impl BitReader<'_> {
 fn huf_canonical_code_table(hcode: &mut [i64]) {
     let mut n = [0i64; 59];
 
-    // For each i from 0 through 58, count the number of different codes of length i, and
-    // store the count in n[i].
-    for i in 0..HUF_ENCSIZE {
-        n[hcode[i] as usize] += 1;
+    for &code in &hcode[..HUF_ENCSIZE] {
+        n[code as usize] += 1;
     }
 
-    // For each i from 58 through 1, compute the numerically lowest code with length i, and
-    // store that code in n[i].
     let mut c = 0i64;
 
     for i in (1..=58).rev() {
@@ -338,8 +348,6 @@ fn huf_canonical_code_table(hcode: &mut [i64]) {
         c = nc;
     }
 
-    // hcode[i] contains the length, l, of the code for symbol i. Assign the next available
-    // code of length l to the symbol and store both l and the code in hcode[i].
     for code in &mut hcode[..HUF_ENCSIZE] {
         let l = *code as i32;
 
@@ -350,11 +358,8 @@ fn huf_canonical_code_table(hcode: &mut [i64]) {
     }
 }
 
-// The heap of the symbols' frequencies, least first, is `std::make_heap`, `std::pop_heap`
-// and `std::push_heap` in the original, and which of two equal frequencies comes first
-// decides the codes: the three are written here as GNU libstdc++ has them
-// (`bits/stl_heap.h`), which is what the port is compared with. `greater` is the
-// original's `FHeapCompare`.
+// The heap of the symbols' frequencies, least first, written as GNU libstdc++ has them
+// (`bits/stl_heap.h`).
 
 /// `std::__push_heap`.
 fn heap_push_at(
@@ -431,21 +436,14 @@ fn push_heap(heap: &mut [usize], len: usize, greater: &dyn Fn(usize, usize) -> b
     heap_push_at(heap, len - 1, 0, value, greater);
 }
 
-/// `hufBuildEncTable`: the frequencies in `frq` become the symbols' codes and lengths. The
-/// answer is the lowest and highest symbols with a code; the highest is one past the last
-/// value that occurs, and stands for a run. (Where the original gives up, which its caller
-/// does not check, the answer is the two as found so far.)
-fn huf_build_enc_table(frq: &mut [i64]) -> (i32, i32) {
-    // This function assumes that when it is called, array frq indicates the frequency of
-    // all possible symbols in the data that are to be Huffman-encoded. (frq[i] contains the
-    // number of occurrences of symbol i in the data.)
-    //
-    // Find the lowest and highest indices where frq is nonzero, and add a pseudo-symbol,
-    // with a frequency count of 1, to frq; it is used for run-length encoding.
-    let mut hlink = vec![0i32; HUF_ENCSIZE];
-    // (Places in `frq`, where the original has pointers into it.)
-    let mut f_heap = vec![0usize; HUF_ENCSIZE];
-
+/// `hufBuildEncTable`: the frequencies in `frq` become the symbols' codes and lengths, using
+/// caller-supplied scratch arrays.
+fn huf_build_enc_table(
+    frq: &mut [i64],
+    hlink: &mut [i32],
+    f_heap: &mut [usize],
+    scode: &mut [i64],
+) -> (i32, i32) {
     let mut im = 0;
     let mut i_m = 0;
 
@@ -472,49 +470,32 @@ fn huf_build_enc_table(frq: &mut [i64]) -> (i32, i32) {
     f_heap[nf] = i_m as usize;
     nf += 1;
 
-    // Build an array, scode, such that scode[i] contains the number of bits assigned to
-    // symbol i. Conceptually this is done by constructing a tree whose leaves are the
-    // symbols with non-zero frequency: the two least frequent are merged over and over.
     {
         let frq_now = &*frq;
-        make_heap(&mut f_heap, nf, &|a, b| frq_now[a] > frq_now[b]);
+        make_heap(f_heap, nf, &|a, b| frq_now[a] > frq_now[b]);
     }
 
-    let mut scode = vec![0i64; HUF_ENCSIZE];
+    scode[..HUF_ENCSIZE].fill(0);
 
     while nf > 1 {
-        // Find the indices, mm and m, of the two smallest non-zero frq values in fHeap,
-        // add the smallest frq to the second-smallest frq, and remove the smallest frq
-        // value from fHeap.
         let mm = f_heap[0];
         {
             let frq_now = &*frq;
-            pop_heap(&mut f_heap, nf, &|a, b| frq_now[a] > frq_now[b]);
+            pop_heap(f_heap, nf, &|a, b| frq_now[a] > frq_now[b]);
         }
         nf -= 1;
 
         let m = f_heap[0];
         {
             let frq_now = &*frq;
-            pop_heap(&mut f_heap, nf, &|a, b| frq_now[a] > frq_now[b]);
+            pop_heap(f_heap, nf, &|a, b| frq_now[a] > frq_now[b]);
         }
 
         frq[m] += frq[mm];
         {
             let frq_now = &*frq;
-            push_heap(&mut f_heap, nf, &|a, b| frq_now[a] > frq_now[b]);
+            push_heap(f_heap, nf, &|a, b| frq_now[a] > frq_now[b]);
         }
-
-        // The entries in scode are linked into lists with the entries in hlink serving as
-        // "next" pointers and with the end of a list marked by hlink[j] == j.
-        //
-        // Traverse the lists that start at scode[m] and scode[mm]. For each element
-        // visited, increment the length of the corresponding code by one bit. (If we
-        // visit scode[j] during the traversal, then the code for symbol j becomes one bit
-        // longer.)
-        //
-        // Merge the lists that start at scode[m] and scode[mm] into a single list that
-        // starts at scode[m].
 
         // Add a bit to all codes in the first list.
         let mut j = m;
@@ -526,7 +507,6 @@ fn huf_build_enc_table(frq: &mut [i64]) -> (i32, i32) {
             }
 
             if hlink[j] as usize == j {
-                // Merge the two lists.
                 hlink[j] = mm as i32;
                 break;
             }
@@ -549,25 +529,12 @@ fn huf_build_enc_table(frq: &mut [i64]) -> (i32, i32) {
         }
     }
 
-    // Build a canonical Huffman code table, replacing the code lengths in scode with
-    // (code, code length) pairs. Copy the code table from scode into frq.
-    huf_canonical_code_table(&mut scode);
-    frq[..HUF_ENCSIZE].copy_from_slice(&scode);
+    huf_canonical_code_table(scode);
+    frq[..HUF_ENCSIZE].copy_from_slice(&scode[..HUF_ENCSIZE]);
 
     (im, i_m)
 }
 
-// Pack an encoding table: only code lengths, not actual codes, are stored; runs of zeroes
-// are compressed as follows:
-//
-//    unpacked            packed
-//    --------------------------------
-//    1 zero              0       (6 bits)
-//    2 zeroes            59
-//    3 zeroes            60
-//    4 zeroes            61
-//    5 zeroes            62
-//    n zeroes (6 or more)    63 n-6      (6 + 8 bits)
 const SHORT_ZEROCODE_RUN: i32 = 59;
 const LONG_ZEROCODE_RUN: i32 = 63;
 const SHORTEST_LONG_RUN: i32 = 2 + LONG_ZEROCODE_RUN - SHORT_ZEROCODE_RUN;
@@ -695,24 +662,18 @@ fn huf_unpack_enc_table(
 /// `hufBuildDecTable`: the table that decodes the codes from `im` to `i_m`. `false`, with
 /// the table as far as it got, when the codes are not a code.
 fn huf_build_dec_table(hcode: &[i64], mut im: i32, i_m: i32, hdecod: &mut [HufDec]) -> bool {
-    // Init hashtable & loop on all codes. Assumes that hufClearDecTable(hdecod) has already
-    // been called.
     while im <= i_m {
         let c = huf_code(hcode[im as usize]);
         let l = huf_length(hcode[im as usize]) as i32;
 
         if c >> l != 0 {
-            // Error: c is supposed to be an l-bit code, but c contains a value that is
-            // greater than the largest l-bit number.
             return false;
         }
 
         if l > HUF_DECBITS {
-            // Long code: add a secondary entry.
             let pl = &mut hdecod[(c >> (l - HUF_DECBITS)) as usize];
 
             if pl.len != 0 {
-                // Error: a short code has already been stored in table entry *pl.
                 return false;
             }
 
@@ -723,13 +684,10 @@ fn huf_build_dec_table(hcode: &[i64], mut im: i32, i_m: i32, hdecod: &mut [HufDe
                 None => pl.p = Some(vec![im as u32]),
             }
         } else if l != 0 {
-            // Short code: init all primary entries.
             let start = (c << (HUF_DECBITS - l)) as usize;
 
             for pl in &mut hdecod[start..start + (1usize << (HUF_DECBITS - l))] {
                 if pl.len != 0 || pl.p.is_some() {
-                    // Error: a short code or a long code has already been stored in table
-                    // entry *pl.
                     return false;
                 }
 
@@ -743,8 +701,9 @@ fn huf_build_dec_table(hcode: &[i64], mut im: i32, i_m: i32, hdecod: &mut [HufDe
     true
 }
 
-/// `hufEncode`: the values of `input`, coded, into `out`. The answer is the number of bits.
-fn huf_encode(hcode: &[i64], input: &[u16], rlc: i32, out: &mut [u8]) -> i32 {
+/// `hufEncode`: the values of `input`, coded, into `out`. Returns total bits written as `u64`
+/// so large blocks cannot overflow `i32`.
+fn huf_encode(hcode: &[i64], input: &[u16], rlc: i32, out: &mut [u8]) -> u64 {
     let ni = input.len();
     let mut w = BitWriter {
         c: 0,
@@ -755,9 +714,7 @@ fn huf_encode(hcode: &[i64], input: &[u16], rlc: i32, out: &mut [u8]) -> i32 {
     let mut s = input[0] as usize;
     let mut cs = 0;
 
-    // Loop on input values.
     for &value in &input[1..ni] {
-        // Count same values or send code.
         if s == value as usize && cs < 255 {
             cs += 1;
         } else {
@@ -768,14 +725,13 @@ fn huf_encode(hcode: &[i64], input: &[u16], rlc: i32, out: &mut [u8]) -> i32 {
         s = value as usize;
     }
 
-    // Send remaining code.
     w.send_code(hcode[s], cs, hcode[rlc as usize]);
 
     if w.lc != 0 {
         w.out[w.pos] = (w.c << (8 - w.lc)) as u8;
     }
 
-    (w.pos * 8) as i32 + w.lc
+    (w.pos as u64) * 8 + (w.lc as u64)
 }
 
 /// What `hufDecode` writes to: the values so far, and how many there may be.
@@ -811,10 +767,8 @@ fn get_code(po: u32, rlc: i32, r: &mut BitReader, in_end: usize, o: &mut DecodeO
         }
         let s = o.out[o.pos - 1];
 
-        for _ in 0..cs {
-            o.out[o.pos] = s;
-            o.pos += 1;
-        }
+        o.out[o.pos..o.pos + cs].fill(s);
+        o.pos += cs;
     } else if o.pos < o.out.len() {
         o.out[o.pos] = po as u16;
         o.pos += 1;
@@ -845,8 +799,8 @@ fn huf_decode(
         input: data,
         pos: start,
     };
-    // `ie` is `in + (ni + 7) / 8`, which is before `in` for a negative number of bits.
-    let ie = start as i64 + i64::from((ni + 7) / 8);
+    // Widen `ni` to `i64` before adding 7 so `ni` near `i32::MAX` never overflows.
+    let ie = (start as i64).saturating_add((i64::from(ni) + 7) / 8);
 
     // Loop on input bytes.
     while (r.pos as i64) < ie {
@@ -898,8 +852,8 @@ fn huf_decode(
         }
     }
 
-    // Get remaining (short) codes.
-    let i = (8 - ni) & 7;
+    // Get remaining (short) codes (`wrapping_sub` avoids overflow for any negative `ni`).
+    let i = 8i32.wrapping_sub(ni) & 7;
     r.c = r.c.wrapping_shr(i as u32);
     r.lc -= i;
 
@@ -919,85 +873,108 @@ fn huf_decode(
     o.pos == no
 }
 
-/// `hufCompress`: the 16-bit values of `raw` into `compressed`: a header of twenty bytes,
-/// the table of code lengths, then the codes. The answer is how many bytes that took.
-pub(crate) fn huf_compress(raw: &[u16], compressed: &mut [u8]) -> usize {
+/// `hufCompress` reusing `PizScratch`'s tables. Returns `None` if the encoded stream exceeds
+/// OpenEXR's 31-bit `n_bits` header field (`> i32::MAX` bits).
+fn huf_compress_with_scratch(
+    raw: &[u16],
+    compressed: &mut [u8],
+    freq: &mut Vec<i64>,
+    hlink: &mut Vec<i32>,
+    f_heap: &mut Vec<usize>,
+    scode: &mut Vec<i64>,
+) -> Option<usize> {
     if raw.is_empty() {
-        return 0;
+        return Some(0);
     }
 
-    let mut freq = vec![0i64; HUF_ENCSIZE];
+    freq.resize(HUF_ENCSIZE, 0);
+    freq[..HUF_ENCSIZE].fill(0);
+    hlink.resize(HUF_ENCSIZE, 0);
+    f_heap.resize(HUF_ENCSIZE, 0);
+    scode.resize(HUF_ENCSIZE, 0);
 
-    // `countFrequencies`.
     for &value in raw {
         freq[value as usize] += 1;
     }
 
-    // (The original ignores whether the table could be built.)
-    let (im, i_m) = huf_build_enc_table(&mut freq);
+    let (im, i_m) = huf_build_enc_table(freq, hlink, f_heap, scode);
 
     let table_start = 20usize;
-    let table_length = huf_pack_enc_table(&freq, im, i_m, &mut compressed[table_start..]);
+    let table_length = huf_pack_enc_table(freq, im, i_m, &mut compressed[table_start..]);
 
     let data_start = table_start + table_length;
-    let n_bits = huf_encode(&freq, raw, i_m, &mut compressed[data_start..]);
-    let data_length = ((n_bits + 7) / 8) as usize;
+    let n_bits_u64 = huf_encode(freq, raw, i_m, &mut compressed[data_start..]);
+    let n_bits = i32::try_from(n_bits_u64).ok()?;
+    let data_length = n_bits_u64.div_ceil(8) as usize;
 
     compressed[0..4].copy_from_slice(&(im as u32).to_le_bytes());
     compressed[4..8].copy_from_slice(&(i_m as u32).to_le_bytes());
     compressed[8..12].copy_from_slice(&(table_length as u32).to_le_bytes());
     compressed[12..16].copy_from_slice(&(n_bits as u32).to_le_bytes());
-    compressed[16..20].copy_from_slice(&0u32.to_le_bytes()); // room for future extensions
+    compressed[16..20].copy_from_slice(&0u32.to_le_bytes());
 
-    data_start + data_length
+    Some(data_start + data_length)
 }
 
-/// `hufUncompress`: the values of `raw` out of the `n_compressed` bytes at the start of
-/// `compressed`, which goes on to the end of the file (a damaged stream can have the original
-/// read a little past its own end, into what follows it there). As the original, it only
-/// says `false` for data that cannot be a stream at all; where the table or the codes turn
-/// out damaged further in, `raw` holds what was decoded up to there and the answer is
-/// `true`.
-pub(crate) fn huf_uncompress(compressed: &[u8], n_compressed: i64, raw: &mut [u16]) -> bool {
-    if n_compressed == 0 {
+/// `hufUncompress` reusing `freq` and `hdec` from `PizScratch`.
+fn huf_uncompress_with_scratch(
+    compressed: &[u8],
+    n_compressed: i64,
+    raw: &mut [u16],
+    freq: &mut Vec<i64>,
+    hdec: &mut Vec<HufDec>,
+) -> bool {
+    if n_compressed <= 0 {
         return false;
     }
 
-    // (Past the end of the file the original reads what is not its own; here that is 0.)
     let read_uint = |at: usize| {
         let byte = |i: usize| u32::from(compressed.get(at + i).copied().unwrap_or(0));
         (byte(0) | (byte(1) << 8) | (byte(2) << 16) | (byte(3) << 24)) as i32
     };
     let im = read_uint(0);
     let i_m = read_uint(4);
-    // let tableLength = readUInt(compressed + 8);
     let n_bits = read_uint(12);
 
-    if im < 0 || im >= HUF_ENCSIZE as i32 || i_m < 0 || i_m >= HUF_ENCSIZE as i32 {
+    if im < 0 || im >= HUF_ENCSIZE as i32 || i_m < 0 || i_m >= HUF_ENCSIZE as i32 || n_bits < 0 {
         return false;
     }
 
     let mut ptr = 20usize;
 
-    {
-        let mut freq = vec![0i64; HUF_ENCSIZE];
-        let mut hdec = vec![HufDec::default(); HUF_DECSIZE];
-
-        // (None of the three answers is looked at by the original.)
-        let table_room = n_compressed - ptr as i64;
-        huf_unpack_enc_table(compressed, &mut ptr, table_room, im, i_m, &mut freq);
-
-        {
-            if i64::from(n_bits) > 8 * (n_compressed - ptr as i64) {
-                return false;
-            }
-
-            huf_build_dec_table(&freq, im, i_m, &mut hdec);
-            huf_decode(&freq, &hdec, compressed, ptr, n_bits, i_m, raw);
+    freq.resize(HUF_ENCSIZE, 0);
+    if hdec.len() < HUF_DECSIZE {
+        hdec.resize_with(HUF_DECSIZE, HufDec::default);
+    } else {
+        for entry in &mut hdec[..HUF_DECSIZE] {
+            entry.len = 0;
+            entry.lit = 0;
+            entry.p = None;
         }
     }
 
+    let table_room = n_compressed - ptr as i64;
+    huf_unpack_enc_table(compressed, &mut ptr, table_room, im, i_m, freq);
+
+    let Some(rem) = n_compressed.checked_sub(ptr as i64) else {
+        return false;
+    };
+    if rem < 0 || i64::from(n_bits) > rem.saturating_mul(8) {
+        return false;
+    }
+
+    huf_build_dec_table(freq, im, i_m, hdec);
+    huf_decode(freq, hdec, compressed, ptr, n_bits, i_m, raw);
+
     true
+}
+
+/// `hufUncompress` standalone entry point.
+#[allow(dead_code)]
+pub(crate) fn huf_uncompress(compressed: &[u8], n_compressed: i64, raw: &mut [u16]) -> bool {
+    let mut freq = Vec::new();
+    let mut hdec = Vec::new();
+    huf_uncompress_with_scratch(compressed, n_compressed, raw, &mut freq, &mut hdec)
 }
 
 // The PIZ compressor itself (OpenEXR's `ImfPizCompressor`).
@@ -1014,7 +991,6 @@ fn bitmap_from_data(data: &[u16], bitmap: &mut [u8]) -> (u16, u16) {
         bitmap[(value >> 3) as usize] |= 1 << (value & 7);
     }
 
-    // zero is not explicitly stored in the bitmap; we assume that the data always contain zeroes
     bitmap[0] &= !1;
     let mut min_non_zero = (BITMAP_SIZE - 1) as u16;
     let mut max_non_zero = 0;
@@ -1033,7 +1009,6 @@ fn bitmap_from_data(data: &[u16], bitmap: &mut [u8]) -> (u16, u16) {
 }
 
 /// `forwardLutFromBitmap`: the table from a value to its place among the values that occur.
-/// The answer is the largest such place.
 fn forward_lut_from_bitmap(bitmap: &[u8], lut: &mut [u16]) -> u16 {
     let mut k = 0i32;
 
@@ -1046,7 +1021,7 @@ fn forward_lut_from_bitmap(bitmap: &[u8], lut: &mut [u16]) -> u16 {
         }
     }
 
-    (k - 1) as u16 // maximum value stored in lut[]
+    (k - 1) as u16
 }
 
 /// `reverseLutFromBitmap`: the table from a place back to its value.
@@ -1062,53 +1037,48 @@ fn reverse_lut_from_bitmap(bitmap: &[u8], lut: &mut [u16]) -> u16 {
 
     let n = k as i32 - 1;
 
-    while k < USHORT_RANGE {
-        lut[k] = 0;
-        k += 1;
-    }
+    lut[k..USHORT_RANGE].fill(0);
 
-    n as u16 // maximum k where lut[k] is non-zero
+    n as u16
 }
 
-/// `CompressPiz`: a block of `num_lines` lines of `data_width` pixels, whose channels are
-/// `channel_sizes` 16-bit words a pixel each (one for a half, two for a float or an
-/// integer), or the block as it is if that is not smaller.
-///
-/// The original writes into a buffer of 8192 bytes and twice the block, which its caller
-/// hands over, and writes past its end for a small block of many different values (the
-/// bitmap alone can take 8192 bytes, and the table of code lengths comes after it). Here
-/// there is room for the most a block can come to, so such a block comes out as the original
-/// would write it with room enough.
-pub(crate) fn compress_piz(
+/// `CompressPiz` appending directly into `out_data`, reusing `scratch` across chunks.
+pub(crate) fn compress_piz_into(
     input: &[u8],
     channel_sizes: &[usize],
     data_width: i32,
     num_lines: i32,
-) -> Vec<u8> {
+    scratch: &mut PizScratch,
+    out_data: &mut Vec<u8>,
+) {
     let in_size = input.len();
-    let mut bitmap = vec![0u8; BITMAP_SIZE];
+    let w = data_width.max(0) as usize;
+    let h = num_lines.max(0) as usize;
+    let pixels = w * h;
 
-    // Assume `inSize` is multiple of 2 or 4.
-    let mut tmp_buffer = vec![0u16; in_size / 2];
+    scratch.bitmap.resize(BITMAP_SIZE, 0);
+    scratch.tmp_buffer.resize(in_size / 2, 0);
+    let tmp_buffer = &mut scratch.tmp_buffer[..in_size / 2];
 
     // (start, nx, ny, size) of each channel in `tmp_buffer`.
     let mut channel_data = Vec::with_capacity(channel_sizes.len());
     let mut tmp_buffer_end = 0usize;
 
     for &size in channel_sizes {
-        channel_data.push((tmp_buffer_end, data_width, num_lines, size as i32));
-        tmp_buffer_end += (data_width * num_lines) as usize * size;
+        channel_data.push((tmp_buffer_end, data_width, num_lines, size));
+        tmp_buffer_end += pixels * size;
     }
 
     {
         let mut ptr = 0usize;
         let mut ends: Vec<usize> = channel_data.iter().map(|cd| cd.0).collect();
-        for _y in 0..num_lines {
+        for _y in 0..h {
             for (i, cd) in channel_data.iter().enumerate() {
-                let n = (cd.1 * cd.3) as usize;
-                for k in 0..n {
-                    tmp_buffer[ends[i] + k] =
-                        u16::from_le_bytes([input[ptr + 2 * k], input[ptr + 2 * k + 1]]);
+                let n = w * cd.3;
+                let src_pairs = input[ptr..ptr + n * 2].as_chunks::<2>().0;
+                for (dst_word, &pair) in tmp_buffer[ends[i]..ends[i] + n].iter_mut().zip(src_pairs)
+                {
+                    *dst_word = u16::from_le_bytes(pair);
                 }
                 ptr += n * 2;
                 ends[i] += n;
@@ -1116,30 +1086,27 @@ pub(crate) fn compress_piz(
         }
     }
 
-    let (min_non_zero, max_non_zero) = bitmap_from_data(&tmp_buffer, &mut bitmap);
+    let (min_non_zero, max_non_zero) = bitmap_from_data(tmp_buffer, &mut scratch.bitmap);
 
-    let mut lut = vec![0u16; USHORT_RANGE];
-    let max_value = forward_lut_from_bitmap(&bitmap, &mut lut);
-    // `applyLut`.
-    for value in &mut tmp_buffer {
-        *value = lut[*value as usize];
+    scratch.lut.resize(USHORT_RANGE, 0);
+    let max_value = forward_lut_from_bitmap(&scratch.bitmap, &mut scratch.lut);
+    for value in tmp_buffer.iter_mut() {
+        *value = scratch.lut[*value as usize];
     }
 
-    // Store range compression info in _outBuffer.
-    // (The two numbers and the bitmap, the Huffman header and its table of at most 65537
-    // lengths of 6 bits each, and at most 17 bits a word.)
-    let mut out = vec![0u8; 8192 + 65536 + 3 * in_size + 256];
+    let max_out = 8192 + 65536 + 3 * in_size + 256;
+    scratch.out.resize(max_out, 0);
     let mut buf = 0usize;
 
-    out[buf..buf + 2].copy_from_slice(&min_non_zero.to_le_bytes());
+    scratch.out[buf..buf + 2].copy_from_slice(&min_non_zero.to_le_bytes());
     buf += 2;
-    out[buf..buf + 2].copy_from_slice(&max_non_zero.to_le_bytes());
+    scratch.out[buf..buf + 2].copy_from_slice(&max_non_zero.to_le_bytes());
     buf += 2;
 
     if min_non_zero <= max_non_zero {
         let n = (max_non_zero - min_non_zero) as usize + 1;
-        out[buf..buf + n]
-            .copy_from_slice(&bitmap[min_non_zero as usize..min_non_zero as usize + n]);
+        scratch.out[buf..buf + n]
+            .copy_from_slice(&scratch.bitmap[min_non_zero as usize..min_non_zero as usize + n]);
         buf += n;
     }
 
@@ -1147,40 +1114,71 @@ pub(crate) fn compress_piz(
     for cd in &channel_data {
         for j in 0..cd.3 {
             wav2_encode(
-                &mut tmp_buffer[cd.0 + j as usize..],
+                &mut tmp_buffer[cd.0 + j..],
                 cd.1,
                 cd.3,
                 cd.2,
-                cd.1 * cd.3,
+                w * cd.3,
                 max_value,
             );
         }
     }
 
-    // Apply Huffman encoding; append the result to _outBuffer.
-    // length header(4byte), then huff data. Initialize length header with zero, then later
-    // fill it by `length`.
     let length_ptr = buf;
-    out[buf..buf + 4].fill(0);
+    scratch.out[buf..buf + 4].fill(0);
     buf += 4;
 
-    let length = huf_compress(&tmp_buffer, &mut out[buf..]);
-    out[length_ptr..length_ptr + 4].copy_from_slice(&(length as i32).to_le_bytes());
+    let Some(length) = huf_compress_with_scratch(
+        tmp_buffer,
+        &mut scratch.out[buf..],
+        &mut scratch.freq,
+        &mut scratch.hlink,
+        &mut scratch.f_heap,
+        &mut scratch.scode,
+    ) else {
+        out_data.extend_from_slice(input);
+        return;
+    };
+    let Ok(length_i32) = i32::try_from(length) else {
+        out_data.extend_from_slice(input);
+        return;
+    };
+    scratch.out[length_ptr..length_ptr + 4].copy_from_slice(&length_i32.to_le_bytes());
 
     let out_size = buf + length;
 
-    // Use uncompressed data when compressed data is larger than uncompressed.
-    // (Issue 40)
+    // Use uncompressed data when compressed data is larger than uncompressed (Issue 40).
     if out_size >= in_size {
-        return input.to_vec();
+        out_data.extend_from_slice(input);
+    } else {
+        out_data.extend_from_slice(&scratch.out[..out_size]);
     }
-    out.truncate(out_size);
+}
+
+/// `CompressPiz` standalone helper.
+#[allow(dead_code)]
+pub(crate) fn compress_piz(
+    input: &[u8],
+    channel_sizes: &[usize],
+    data_width: i32,
+    num_lines: i32,
+) -> Vec<u8> {
+    let mut scratch = PizScratch::default();
+    let mut out = Vec::new();
+    compress_piz_into(
+        input,
+        channel_sizes,
+        data_width,
+        num_lines,
+        &mut scratch,
+        &mut out,
+    );
     out
 }
 
-/// `DecompressPiz`: a block of `tmp_buf_size_in_bytes` bytes into `out`, from the `in_len`
-/// bytes at the start of `input`, which goes on to the end of the file.
-pub(crate) fn decompress_piz(
+/// `DecompressPiz` reusing `scratch` across chunks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decompress_piz_with_scratch(
     out: &mut [u8],
     input: &[u8],
     tmp_buf_size_in_bytes: usize,
@@ -1188,19 +1186,24 @@ pub(crate) fn decompress_piz(
     channel_sizes: &[usize],
     data_width: i32,
     num_lines: i32,
+    scratch: &mut PizScratch,
 ) -> bool {
+    if data_width < 0 || num_lines < 0 {
+        return false;
+    }
     if in_len == tmp_buf_size_in_bytes {
         // Data is not compressed (Issue 40).
         out[..in_len].copy_from_slice(&input[..in_len]);
         return true;
     }
 
-    let mut bitmap = vec![0u8; BITMAP_SIZE];
-
     // minimum length for PIZ is 4 bytes
     if in_len < 4 {
         return false;
     }
+
+    scratch.bitmap.clear();
+    scratch.bitmap.resize(BITMAP_SIZE, 0);
 
     let mut read_len = 0usize;
     let mut ptr = 0usize;
@@ -1216,25 +1219,18 @@ pub(crate) fn decompress_piz(
     if min_non_zero <= max_non_zero {
         let n = max_non_zero - min_non_zero + 1;
         if n + read_len > in_len {
-            // Input too short
             return false;
         }
 
-        bitmap[min_non_zero..min_non_zero + n].copy_from_slice(&input[ptr..ptr + n]);
+        scratch.bitmap[min_non_zero..min_non_zero + n].copy_from_slice(&input[ptr..ptr + n]);
         ptr += n;
         read_len += n;
-    } else {
-        // Issue 194
-        if min_non_zero == BITMAP_SIZE - 1 && max_non_zero == 0 {
-            // OK. all pixels are zero. And no need to read `bitmap` data.
-        } else {
-            // invalid minNonZero/maxNonZero combination.
-            return false;
-        }
+    } else if !(min_non_zero == BITMAP_SIZE - 1 && max_non_zero == 0) {
+        return false;
     }
 
-    let mut lut = vec![0u16; USHORT_RANGE];
-    let max_value = reverse_lut_from_bitmap(&bitmap, &mut lut);
+    scratch.lut.resize(USHORT_RANGE, 0);
+    let max_value = reverse_lut_from_bitmap(&scratch.bitmap, &mut scratch.lut);
 
     // Huffman decoding
     if read_len + 4 > in_len {
@@ -1244,50 +1240,61 @@ pub(crate) fn decompress_piz(
     let length = i32::from_le_bytes([input[ptr], input[ptr + 1], input[ptr + 2], input[ptr + 3]]);
     ptr += 4;
 
-    // (The original compares as an unsigned number, so a sum below zero is too large too.)
     let end = ptr as i64 + i64::from(length);
     if end < 0 || end as u64 > in_len as u64 {
         return false;
     }
 
-    let mut tmp_buffer = vec![0u16; tmp_buf_size_in_bytes / 2];
-    huf_uncompress(&input[ptr..], i64::from(length), &mut tmp_buffer);
+    let words = tmp_buf_size_in_bytes / 2;
+    scratch.tmp_buffer.clear();
+    scratch.tmp_buffer.resize(words, 0);
+    huf_uncompress_with_scratch(
+        &input[ptr..],
+        i64::from(length),
+        &mut scratch.tmp_buffer[..words],
+        &mut scratch.freq,
+        &mut scratch.hdec,
+    );
 
     // Wavelet decoding
+    let w = data_width as usize;
+    let h = num_lines as usize;
+    let pixels = w * h;
     let mut channel_data = Vec::with_capacity(channel_sizes.len());
     let mut tmp_buffer_end = 0usize;
 
     for &size in channel_sizes {
-        channel_data.push((tmp_buffer_end, data_width, num_lines, size as i32));
-        tmp_buffer_end += (data_width * num_lines) as usize * size;
+        channel_data.push((tmp_buffer_end, data_width, num_lines, size));
+        tmp_buffer_end += pixels * size;
     }
 
+    let tmp_buffer = &mut scratch.tmp_buffer[..words];
     for cd in &channel_data {
         for j in 0..cd.3 {
             wav2_decode(
-                &mut tmp_buffer[cd.0 + j as usize..],
+                &mut tmp_buffer[cd.0 + j..],
                 cd.1,
                 cd.3,
                 cd.2,
-                cd.1 * cd.3,
+                w * cd.3,
                 max_value,
             );
         }
     }
 
     // Expand the pixel data to their original range.
-    for value in &mut tmp_buffer {
-        *value = lut[*value as usize];
+    for value in tmp_buffer.iter_mut() {
+        *value = scratch.lut[*value as usize];
     }
 
     let mut out_ptr = 0usize;
     let mut ends: Vec<usize> = channel_data.iter().map(|cd| cd.0).collect();
-    for _y in 0..num_lines {
+    for _y in 0..h {
         for (i, cd) in channel_data.iter().enumerate() {
-            let n = (cd.1 * cd.3) as usize;
-            for k in 0..n {
-                out[out_ptr + 2 * k..out_ptr + 2 * k + 2]
-                    .copy_from_slice(&tmp_buffer[ends[i] + k].to_le_bytes());
+            let n = w * cd.3;
+            let dst_pairs = out[out_ptr..out_ptr + n * 2].as_chunks_mut::<2>().0;
+            for (dst_pair, &word) in dst_pairs.iter_mut().zip(&tmp_buffer[ends[i]..ends[i] + n]) {
+                *dst_pair = word.to_le_bytes();
             }
             out_ptr += n * 2;
             ends[i] += n;
@@ -1295,4 +1302,54 @@ pub(crate) fn decompress_piz(
     }
 
     true
+}
+
+/// `DecompressPiz` standalone helper.
+#[allow(dead_code)]
+pub(crate) fn decompress_piz(
+    out: &mut [u8],
+    input: &[u8],
+    tmp_buf_size_in_bytes: usize,
+    in_len: usize,
+    channel_sizes: &[usize],
+    data_width: i32,
+    num_lines: i32,
+) -> bool {
+    let mut scratch = PizScratch::default();
+    decompress_piz_with_scratch(
+        out,
+        input,
+        tmp_buf_size_in_bytes,
+        in_len,
+        channel_sizes,
+        data_width,
+        num_lines,
+        &mut scratch,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_huffman_nbits_does_not_overflow() {
+        // Previously `n_bits = i32::MIN` panicked with signed subtraction overflow at `8 - ni`
+        // inside `huf_decode`, and `ni = i32::MAX` overflowed `ni + 7`.
+        for bad_nbits in [i32::MIN, i32::MIN + 1, -1, i32::MAX] {
+            let mut huf_stream = [0u8; 32];
+            huf_stream[0..4].copy_from_slice(&0i32.to_le_bytes()); // im = 0
+            huf_stream[4..8].copy_from_slice(&1i32.to_le_bytes()); // iM = 1
+            huf_stream[8..12].copy_from_slice(&1i32.to_le_bytes()); // tableLength = 1
+            huf_stream[12..16].copy_from_slice(&bad_nbits.to_le_bytes()); // nBits
+            let mut raw = [0u16; 16];
+            assert!(!huf_uncompress(&huf_stream, 32, &mut raw));
+            assert_eq!(raw, [0u16; 16]);
+
+            // Also test directly on `huf_decode` with arbitrary `ni` extremes.
+            let freq = vec![0i64; HUF_ENCSIZE];
+            let hdec = vec![HufDec::default(); HUF_DECSIZE];
+            let _ = huf_decode(&freq, &hdec, &huf_stream, 20, bad_nbits, 1, &mut raw);
+        }
+    }
 }
