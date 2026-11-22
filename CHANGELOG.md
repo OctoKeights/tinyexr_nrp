@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0
+
+- **Parallel chunk coding, `save_deep`, modular features and single-part loading.** Added
+  multi-threaded scanline and tile compression and decompression (`load_image_parallel`,
+  `load_rgba_parallel`, `save_image_parallel`, `save_floats_parallel`), deep scanline writing
+  (`save_deep`), single-part multipart decoding (`load_multipart_part`), file and stream I/O
+  helpers, and modular Cargo features (`std`, `dwa`, `zfp`) supporting `#![no_std]` + `alloc`
+  builds. Upgraded to `miniz_nrp` 0.3, `openexr_nrp` 0.3 and `zfp_nrp` 0.3.
+
+- **Faster chunk pipelines.** Reused `PizScratch`, `miniz_nrp::Compressor` and
+  `openexr_nrp::dwa::Context` across chunks, decoded ZFP chunks with zero-copy
+  `zfp_nrp::BitReader`, dropped the unused 128 KiB PIZ table, and vectorized `zip_rle` byte
+  splitting and interleaving.
+
+- **Hardened decoders and Windows test fix.** Guarded PIZ Huffman bit-buffer underflow on
+  corrupt code lengths, validated `requested_pixel_types` lengths, fixed B44 subsampling `i32`
+  wrap hangs and 32-bit/64-bit tile/RGBA size overflows, honored `ChannelInfo::p_linear` in
+  DWAA/DWAB encoding, truncated null-padded custom attribute names cleanly, implemented
+  `Display` and `Error` on `ErrorCode`, and normalized line endings in `tests/golden.rs`.
+
+- Output is unchanged, checked against tinyexr 3.4.0 on 288,000 synthetic files.
+
 ## 0.3.0
 
 - **Breaking: flags and codes as types.** `ExrHeader`'s `tiled`, `long_name`, `non_image` and

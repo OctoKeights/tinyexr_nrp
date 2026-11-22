@@ -34,7 +34,7 @@ not support, as OpenEXR does.
 
 ```toml
 [dependencies]
-tinyexr_nrp = "0.3"
+tinyexr_nrp = "0.4"
 ```
 
 ## Quick start
